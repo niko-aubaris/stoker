@@ -132,6 +132,7 @@ static int g_tab = 0;
 // starts with that type filter active instead of All
 static std::map<std::string, std::string> g_tab_default_filter;
 static std::string g_pulled_at;
+static std::string g_corp_name;  // whose structures the active feed shows
 static std::string g_esi_lastmod, g_esi_expires;  // CCP regenerates hourly
 static std::string g_status = "connecting to the box...";
 static std::string g_note;         // last claim result, shown for a few seconds
@@ -311,7 +312,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.0.3";
+static const char* STOKER_VERSION = "v1.0.4";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -626,6 +627,7 @@ static void ingest(const std::string& raw) {
     g_rows = std::move(rows);
     g_refuels = std::move(refuels);
     g_pulled_at = d.value("pulled_at", "");
+    g_corp_name = d.value("corp", "");
     g_esi_lastmod = d.contains("esi_last_modified") && !d["esi_last_modified"].is_null()
                         ? d["esi_last_modified"].get<std::string>() : "";
     g_esi_expires = d.contains("esi_expires") && !d["esi_expires"].is_null()
@@ -1038,7 +1040,7 @@ int main(int argc, char** argv) {
         std::vector<Refuel> refuels;
         std::vector<std::string> tabs;
         int total, under14, under7, tabsel;
-        std::string pulled, status, esiMod, esiExp, note, upd;
+        std::string pulled, status, esiMod, esiExp, note, upd, corpname;
         {
             std::lock_guard<std::mutex> l(g_mtx);
             total = (int)g_rows.size();
@@ -1050,6 +1052,7 @@ int main(int argc, char** argv) {
             tabs = g_tab_labels;
             tabsel = g_tab;
             upd = g_update_tag;
+            corpname = g_corp_name;
             if (g_note_at && time(nullptr) - g_note_at < 20) note = g_note;
         }
         const bool have_tabs = tabs.size() > 1;
@@ -1221,7 +1224,9 @@ int main(int argc, char** argv) {
             text(" ▌") | color(NEON_PINK),
             text("STOKER") | bold | color(NEON_PINK),
             text(std::string(" ") + STOKER_VERSION + " ") | color(INK_GRAY),
-            text(log_mode ? "» refuel log " : "» BPOS fuel watch ") | color(NEON_DIM_CYAN),
+            text(log_mode ? "» refuel log "
+                          : "» " + (corpname.empty() ? "" : corpname + " ") + "fuel watch ")
+                | color(NEON_DIM_CYAN),
             text(g_standalone ? "[standalone] " : "[corp] ") | color(INK_GRAY),
             (upd.empty() ? text("")
                          : text(" " + upd + " available - press u ") | color(Color::RGB(250, 215, 70))),

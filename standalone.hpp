@@ -5,7 +5,8 @@
 //
 // Requires an EVE developer application (https://developers.eveonline.com):
 //   callback URL  http://localhost:8420/callback
-//   scope         esi-corporations.read_structures.v1
+//   scopes        esi-corporations.read_structures.v1
+//                 esi-assets.read_corporation_assets.v1
 // The in-game character needs the Station_Manager role (or Director).
 //
 // Include AFTER run_cmd/urlenc/parse_iso in bpos-dash.cpp (single-TU project).
@@ -39,10 +40,12 @@ namespace standalone {
 static const int CALLBACK_PORT = 8420;
 static const char* SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token";
 static const char* ESI = "https://esi.evetech.net/latest";
-static const char* SCOPE = "esi-corporations.read_structures.v1";
-// Requested at login. Overridable via config.json "scopes" so a copy whose
-// dev app allows more (e.g. + esi-assets.read_corporation_assets.v1 for the
-// 2ND FUEL column) can ask for it without changing everyone's default.
+// Requested at login: structures (the dashboard) + corp assets (the F²
+// fuel-bay column; only readable in-game by Directors, others just 403 to
+// "?"). Overridable via config.json "scopes", e.g. to trim back to
+// structures-only.
+static const char* SCOPE =
+    "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1";
 static std::string g_scopes = SCOPE;
 // Refuel-history service: standalone clients have no storage, so each poll
 // reports its snapshot here and reads back the refuel log the server builds
@@ -600,7 +603,7 @@ static double fuel_per_day(const std::string& type_name, const json& services) {
 // --- the fetch: one corp's structures straight off ESI ------------------------
 // Returns /bpos-shaped JSON, or "" with err set (keeps the last table on screen).
 static std::string fetch_corp(const std::string& tok, long long corp_id,
-                              std::string& err) try {
+                              const std::string& corp_display, std::string& err) try {
     int st = 0;
     json structures = json::array(), hdr = json::object();
     for (int page = 1, pages = 1; page <= pages && page <= 20; page++) {
@@ -691,6 +694,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     std::strftime(now_iso, sizeof now_iso, "%Y-%m-%dT%H:%M:%SZ", &now_tm);
 
     json out;
+    out["corp"] = corp_display;  // the header brands itself with this
     out["pulled_at"] = now_iso;
     std::string lm = http_date_to_iso(hdr.value("last-modified", std::string()));
     std::string ex = http_date_to_iso(hdr.value("expires", std::string()));
@@ -819,16 +823,17 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
             continue;
         seen.push_back(corp_id);
 
-        std::string label = std::to_string(corp_id);
+        std::string label = std::to_string(corp_id), corp_name;
         try {
             json corp = json::parse(http_get(ESI + std::string("/corporations/") +
                                                  std::to_string(corp_id) + "/", "", st));
             std::string tick = corp.value("ticker", ""), nm = corp.value("name", "");
             label = !tick.empty() ? tick : (!nm.empty() ? nm : label);
+            corp_name = nm;
         } catch (...) {}
 
         std::string err;
-        std::string data = fetch_corp(tok, corp_id, err);
+        std::string data = fetch_corp(tok, corp_id, corp_name.empty() ? label : corp_name, err);
         if (data.empty()) {
             if (first_err.empty() && !err.empty()) first_err = who + ": " + err;
             continue;

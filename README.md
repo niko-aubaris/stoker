@@ -25,11 +25,10 @@ or ESI refuses the corp structure list.
 Standalone (EVE login) mode shows name / system / type / state / services /
 fuel days for every corp structure. The 2ND FUEL column (Magmatic Gas on
 Metenox drills, Liquid Ozone on Ansiblex gates and Pharolux beacons) reads
-the structure fuel bay from corp assets, which needs two extras: your dev
-app must allow the `esi-assets.read_corporation_assets.v1` scope, your
-config.json must request it (`"scopes": "esi-corporations.read_structures.v1
-esi-assets.read_corporation_assets.v1"`), and the character needs the
-in-game Director role. Anything short of that shows "?". Burn rates, bay estimates and the
+the structure fuel bay from corp assets. The login requests both read-only
+scopes by default; the column needs the in-game Director role and shows
+"?" without it. Set `"scopes"` in config.json to trim the request back
+to structures-only if you prefer. Burn rates, bay estimates and the
 refuel log are computed server-side by a hosted STOKER backend and show as
 unknown without one.
 
