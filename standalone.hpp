@@ -83,8 +83,7 @@ static int winhttp_req(const std::string& url, const wchar_t* method,
     DWORD dec = WINHTTP_DECOMPRESSION_FLAG_ALL;
     WinHttpSetOption(ses, WINHTTP_OPTION_DECOMPRESSION, &dec, sizeof dec);
 #endif
-    DWORD tmo = 30000;
-    WinHttpSetTimeouts(ses, tmo, tmo, tmo, tmo);
+    WinHttpSetTimeouts(ses, 8000, 8000, 15000, 15000);  // resolve/connect/send/receive
     int status = 0;
     HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
     HINTERNET req = nullptr;
@@ -121,14 +120,17 @@ static int winhttp_req(const std::string& url, const wchar_t* method,
                 (*headers_out)["last-modified"] = qh(L"last-modified");
                 (*headers_out)["expires"] = qh(L"expires");
             }
+            bool clean_eof = false;
             for (;;) {
                 DWORD avail = 0;
-                if (!WinHttpQueryDataAvailable(req, &avail) || !avail) break;
+                if (!WinHttpQueryDataAvailable(req, &avail)) break;
+                if (!avail) { clean_eof = true; break; }
                 std::string chunk(avail, 0);
                 DWORD got = 0;
                 if (!WinHttpReadData(req, chunk.data(), avail, &got) || !got) break;
                 out.append(chunk.data(), got);
             }
+            if (!clean_eof) status = 0;  // truncated body: let the fallbacks run
         }
     }
     if (req) WinHttpCloseHandle(req);
@@ -317,8 +319,29 @@ static void save_json_file(const std::filesystem::path& p, const json& j) {
 // revocation checks can't complete (AV https-scanning, VPNs, some home
 // routers). When a request comes back empty there, retry once with
 // --ssl-no-revoke and stick with it for the session.
-static std::string g_curl_extra;  // sticky flags that made curl work on this box
-static std::string curl_flags() { return g_curl_extra.empty() ? std::string() : g_curl_extra + " "; }
+static std::mutex g_curl_mtx;      // worker + refresh/claim/update threads share these
+static std::string g_curl_extra;   // sticky flags that made curl work on this box
+static time_t g_chain_cooldown = 0;  // after a full-chain failure, back off
+
+static std::string curl_flags() {
+    std::lock_guard<std::mutex> l(g_curl_mtx);
+    return g_curl_extra.empty() ? std::string() : g_curl_extra + " ";
+}
+
+#ifdef _WIN32
+static std::string win_system_proxy();
+// The escalating broken-TLS fallbacks, in one place (run_curl + download_file)
+static std::vector<std::string> curl_fallbacks() {
+    std::vector<std::string> tries = {"--ssl-no-revoke",
+                                      "--ssl-no-revoke --tlsv1.2 --tls-max 1.2"};
+    std::string prx = win_system_proxy();
+    if (!prx.empty()) {
+        tries.push_back("--proxy \"" + prx + "\"");
+        tries.push_back("--proxy \"" + prx + "\" --ssl-no-revoke");
+    }
+    return tries;
+}
+#endif
 
 #ifdef _WIN32
 // Browsers use the Windows proxy settings; curl does not. On proxy-required
@@ -363,21 +386,22 @@ static std::string run_curl(const std::string& args) {
     std::string out = run_cmd(("curl -s " + curl_flags() + args + QUIET).c_str());
 #ifdef _WIN32
     if (out.empty()) {
-        // escalating fallbacks for broken-TLS setups: revocation checks first
-        // (cheap, common), forced TLS 1.2 for middleboxes that fumble 1.3,
-        // then the Windows system proxy that browsers use and curl ignores
-        std::vector<std::string> tries = {"--ssl-no-revoke",
-                                          "--ssl-no-revoke --tlsv1.2 --tls-max 1.2"};
-        std::string prx = win_system_proxy();
-        if (!prx.empty()) {
-            tries.push_back("--proxy \"" + prx + "\"");
-            tries.push_back("--proxy \"" + prx + "\" --ssl-no-revoke");
+        {
+            std::lock_guard<std::mutex> l(g_curl_mtx);
+            if (time(nullptr) < g_chain_cooldown) return out;  // network down; don't grind
         }
-        for (auto& f : tries) {
-            if (g_curl_extra == f) continue;
+        std::string winner;
+        for (auto& f : curl_fallbacks()) {
+            {
+                std::lock_guard<std::mutex> l(g_curl_mtx);
+                if (g_curl_extra == f) continue;
+            }
             out = run_cmd(("curl -s " + f + " " + args + QUIET).c_str());
-            if (!out.empty()) { g_curl_extra = f; break; }
+            if (!out.empty()) { winner = f; break; }
         }
+        std::lock_guard<std::mutex> l(g_curl_mtx);
+        if (!winner.empty()) g_curl_extra = winner;
+        else g_chain_cooldown = time(nullptr) + 300;
     }
 #endif
     return out;
@@ -397,6 +421,14 @@ static std::string curl_error(const std::string& args) {
     ver = ver.substr(0, ver.find_first_of("\r\n"));
     if (!ver.empty()) msg += "  [" + ver.substr(0, 48) + "]";
     return msg;
+}
+
+// body-only GET for callers that don't care about the status code
+static std::string http_get(const std::string& url, const std::string& bearer,
+                            int& status, json* headers_out);
+static std::string http_get_body(const std::string& url) {
+    int st = 0;
+    return http_get(url, "", st, nullptr);
 }
 
 static std::string http_post_form(const std::string& url, const std::string& body) {
@@ -479,6 +511,51 @@ static std::string http_get(const std::string& url, const std::string& bearer,
         (*headers_out)["expires"] = grab("expires");
     }
     return raw.substr(sep + sw);
+}
+
+// Download url to path (counts only if >= min_size bytes land). WinHTTP first
+// on Windows, then curl with the same escalating TLS fallbacks as run_curl -
+// keyed on the file arriving, since -o leaves stdout empty either way.
+static bool download_file(const std::string& url, const std::filesystem::path& path,
+                          size_t min_size) {
+    std::error_code ec;
+    auto landed = [&]() {
+        return std::filesystem::exists(path, ec) &&
+               std::filesystem::file_size(path, ec) >= min_size;
+    };
+#ifdef _WIN32
+    {
+        std::string blob;
+        if (winhttp_req(url, L"GET", "", "", nullptr, blob, nullptr) == 200 &&
+            blob.size() >= min_size) {
+            std::ofstream f(path, std::ios::binary);
+            f.write(blob.data(), (std::streamsize)blob.size());
+        }
+        if (landed()) return true;
+    }
+#endif
+    auto try_curl = [&](const std::string& flags) {
+        std::filesystem::remove(path, ec);
+        run_cmd(("curl -sL " + (flags.empty() ? std::string() : flags + " ") +
+                 "--max-time 120 -o \"" + path.string() + "\" \"" + url + "\"" QUIET)
+                    .c_str());
+        return landed();
+    };
+    if (try_curl(curl_flags())) return true;
+#ifdef _WIN32
+    for (auto& f : curl_fallbacks()) {
+        {
+            std::lock_guard<std::mutex> l(g_curl_mtx);
+            if (g_curl_extra == f) continue;
+        }
+        if (try_curl(f + " ")) {
+            std::lock_guard<std::mutex> l(g_curl_mtx);
+            g_curl_extra = f;
+            return true;
+        }
+    }
+#endif
+    return false;
 }
 
 // --- loopback callback listener ----------------------------------------------

@@ -77,7 +77,7 @@ static const Color INK_GRAY = Color::RGB(110, 118, 138);
 // directly with the user's own EVE SSO login (no burn rates / refuel log /
 // claims, those are server-side).
 static bool g_standalone = false;
-static std::string g_fetch_cmd, g_refresh_cmd, g_claim_url, g_client_id;
+static std::string g_fetch_url, g_refresh_url, g_claim_url, g_client_id;
 static const int REFRESH_SECONDS = 30;       // corp endpoint poll
 static const int ESI_REFRESH_SECONDS = 300;  // ESI caches corp structures ~1h
 
@@ -105,6 +105,10 @@ struct Row {
 
 // Types that carry a secondary fuel besides blocks: Metenox drink magmatic
 // gas, gates and cyno beacons burn liquid ozone per jump.
+static double fuel2_days(const Row& r) {
+    return r.gas_day > 0 && r.fuel2 >= 0 ? r.fuel2 / r.gas_day : -1;
+}
+
 static const char* fuel2_kind(const std::string& type) {
     if (type == "Metenox Moon Drill") return "Magmatic Gas";
     if (type.rfind("Ansiblex", 0) == 0) return "Liquid Ozone";   // "... Jump Bridge"
@@ -204,18 +208,35 @@ static std::string pad(const std::string& s, int w, bool right = false) {
     return right ? p + s : s + p;
 }
 
-static std::string fuel_label(const Row& r) {
-    if (!r.has_fuel) return pad("--", 6, true);
-    char b[32];
-    std::snprintf(b, sizeof b, "%.1fd", r.days);
-    return pad(b, 6, true);
+
+// 0 red, 1 orange, 2 yellow, 3 green, -1 grey/no-data; both UIs map these
+static int urgency_band(double days) {
+    if (days < 3) return 0;
+    if (days < 7) return 1;
+    if (days < 14) return 2;
+    return 3;
 }
 
-static Color days_color(double days) {
-    if (days < 3) return Color::RGB(255, 70, 70);
-    if (days < 7) return Color::RGB(255, 140, 0);   // orange
-    if (days < 14) return Color::RGB(250, 215, 70);
-    return Color::RGB(90, 225, 130);
+static Color band_color(int band) {
+    switch (band) {
+        case 0: return Color::RGB(255, 70, 70);
+        case 1: return Color::RGB(255, 140, 0);
+        case 2: return Color::RGB(250, 215, 70);
+        case 3: return Color::RGB(90, 225, 130);
+        default: return Color::RGB(128, 136, 150);
+    }
+}
+
+static Color days_color(double days) { return band_color(urgency_band(days)); }
+
+// -1 grey (no data), else an urgency band for the secondary fuel
+static int fuel2_band(const Row& r) {
+    if (r.fuel2_name.empty() || r.fuel2 < 0) return -1;
+    if (r.fuel2 <= 0) return 0;
+    if (double d = fuel2_days(r); d >= 0) return urgency_band(d);
+    if (r.lo_min > 0 && r.fuel2 < r.lo_min) return 1;
+    if (r.lo_target > 0 && r.fuel2 < r.lo_target) return 2;
+    return 3;
 }
 
 static Color fuel_color(const Row& r) {
@@ -240,38 +261,15 @@ static std::string commas(double v) {
 
 // Haul to 30d: UNITS = fuel blocks, M3 = their volume (blocks are 5 m3).
 // Only gates/beacons have a verified flat rate; everything else shows --.
-static std::string units_label(const Row& r) {
-    if (r.need < 0) return pad("--", 7, true);
-    if (r.need == 0) return pad("ok", 7, true);
-    return pad(commas(r.need), 7, true);
+static std::string units_raw(const Row& r) {
+    if (r.need < 0) return "--";
+    if (r.need == 0) return "ok";
+    return commas(r.need);
 }
 
-static std::string m3_label(const Row& r) {
-    if (r.m3 < 0) return pad("--", 9, true);
-    if (r.m3 == 0) return pad("-", 9, true);
-    return pad(commas(r.m3), 9, true);
-}
 
-// 2ND FUEL column: stock units of the secondary fuel; "?" when the type has
-// one but no data source can see the bay (needs a Director-role token).
-static std::string fuel2_label(const Row& r) {
-    if (r.fuel2_name.empty()) return pad("-", 9, true);
-    if (r.fuel2 < 0) return pad("?", 9, true);
-    return pad(commas(r.fuel2), 9, true);
-}
 
-static Color fuel2_color(const Row& r) {
-    if (r.fuel2_name.empty() || r.fuel2 < 0) return Color::RGB(128, 136, 150);
-    if (r.fuel2 <= 0) return Color::RGB(255, 70, 70);
-    // Metenox: color by days of gas left (4800/day); gates: by ozone doctrine tier
-    if (r.gas_day > 0) {
-        double d = r.fuel2 / r.gas_day;
-        return d < 7 ? Color::RGB(255, 70, 70)
-             : d < 14 ? Color::RGB(250, 215, 70) : Color::RGB(90, 225, 130);
-    }
-    if (r.lo_min > 0 && r.fuel2 < r.lo_min) return Color::RGB(250, 215, 70);
-    return Color::RGB(90, 225, 130);
-}
+static Color fuel2_color(const Row& r) { return band_color(fuel2_band(r)); }
 
 static Color need_color(const Row& r) {
     if (r.need < 0) return Color::RGB(128, 136, 150);
@@ -282,16 +280,118 @@ static Color need_color(const Row& r) {
 // Effective burn: prefer the 7d window, fall back to 30d (detail line only).
 static double burn_of(const Row& r) { return r.burn7 >= 0 ? r.burn7 : r.burn30; }
 
-static std::string fuel_bar(const Row& r) {
-    if (!r.has_fuel) return "      ";
-    double frac = r.days / 30.0;
-    if (frac < 0) frac = 0;
+// A gauge with its value written INSIDE: label chars ride the bar, showing
+// inverted on the filled part and colored on the empty part. frac < 0 means
+// "no gauge": the label renders centered and grey.
+static const double GAUGE_DAYS = 30.0;  // every days gauge renders on this scale
+
+static int cells(const std::string& s) {  // display cells = UTF-8 codepoints here
+    int n = 0;
+    for (unsigned char c : s)
+        if ((c & 0xC0) != 0x80) n++;
+    return n;
+}
+
+static std::string cells_prefix(const std::string& s, int n) {
+    int seen = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        if ((s[i] & 0xC0) != 0x80) {
+            if (seen == n) break;
+            seen++;
+        }
+        i++;
+    }
+    while (i < s.size() && (s[i] & 0xC0) == 0x80) i++;
+    return s.substr(0, i);
+}
+
+// left-anchored + right-anchored text composed to exactly `width` cells
+static std::string two_sided(const std::string& l, const std::string& r, int width) {
+    int cl = cells(l), cr = cells(r);
+    if (cl + cr + 1 > width) return pad(l, width);  // no room: keep the left value
+    return l + std::string((size_t)(width - cl - cr), ' ') + r;
+}
+
+static Element bar_with_text(std::string label, double frac, Color col, int width) {
+    if (cells(label) > width) label = cells_prefix(label, width);
+    if (frac < 0) {  // no gauge: just the label, centered, in the caller's color
+        int lp = std::max(0, (width - cells(label)) / 2);
+        return text(pad(std::string((size_t)lp, ' ') + label, width)) | color(col);
+    }
     if (frac > 1) frac = 1;
-    int filled = (int)(frac * 6 + 0.5);
-    std::string s;
-    for (int i = 0; i < 6; i++) s += (i < filled) ? "█" : "░";
+    // at most four style runs: label-on-fill, label-past-fill, fill, empty tail
+    int fill = (int)std::lround(frac * width);
+    int lab = cells(label);
+    int on_fill = std::min(lab, fill);
+    int past_fill = lab - on_fill;
+    int blank_fill = std::max(0, fill - lab);
+    int tail = width - std::max(fill, lab);
+    std::string head = cells_prefix(label, on_fill);
+    Elements runs;
+    if (on_fill)
+        runs.push_back(text(head) | bgcolor(col) | color(Color::RGB(10, 10, 16)) | bold);
+    if (past_fill) runs.push_back(text(label.substr(head.size())) | color(col) | bold);
+    if (blank_fill) runs.push_back(text(std::string((size_t)blank_fill, ' ')) | bgcolor(col));
+    if (tail > 0) {
+        std::string t;
+        for (int i = 0; i < tail; i++) t += "░";  // 3 UTF-8 bytes per cell
+        runs.push_back(text(t) | color(col) | dim);
+    }
+    return hbox(runs);
+}
+
+// 1,234,567 -> "1.2M"; 14,900 -> "14.9k"; keeps tiny numbers plain
+static std::string compact_units(double v) {
+    char b[32];
+    if (v >= 1e6) std::snprintf(b, sizeof b, "%.1fM", v / 1e6);
+    else if (v >= 1e4) std::snprintf(b, sizeof b, "%.1fk", v / 1e3);
+    else std::snprintf(b, sizeof b, "%.0f", v);
+    return b;
+}
+
+// GAS-2-30D column: secondary fuel to haul. Metenox: gas to reach 30 days at
+// the drill rate; gates/beacons: liquid ozone to reach the doctrine fill-to.
+static std::string gas30_raw(const Row& r) {
+    double need = -1;
+    if (r.gas_day > 0)
+        need = std::max(0.0, std::round((GAUGE_DAYS - fuel2_days(r)) * r.gas_day));
+    else if (r.lo_target > 0)
+        need = std::max(0.0, r.lo_target - r.fuel2);
+    if (need < 0) return "";
+    if (need == 0) return "ok";
+    std::string s = commas(need);
+    if ((int)s.size() > 7) s = compact_units(need);
     return s;
 }
+
+// One 30-day gauge scale for every days-based bar on the desk; `right` rides
+// the far end of the bar (the haul needed to reach 30 days)
+static Element days_gauge(double days, const std::string& right, Color col, int width) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1fd", days);
+    return bar_with_text(two_sided(b, right, width), std::max(0.0, days / GAUGE_DAYS),
+                         col, width);
+}
+
+// F cell: fuel gauge, days inside on the left, blocks-to-30d on the right
+static Element fuel_cell(const Row& r, int width) {
+    if (!r.has_fuel) return bar_with_text("--", -1, fuel_color(r), width);
+    return days_gauge(r.days, units_raw(r), fuel_color(r), width);
+}
+
+// F² cell: secondary fuel gauge. Metenox gas has a burn rate, so it shows
+// days remaining on the same 30d scale; ozone has no flat rate, so the bar
+// fills against the doctrine fill-to target with the stock inside.
+static Element fuel2_cell(const Row& r, int width) {
+    if (r.fuel2_name.empty()) return bar_with_text("-", -1, fuel2_color(r), width);
+    if (r.fuel2 < 0) return bar_with_text("?", -1, fuel2_color(r), width);
+    if (r.gas_day > 0) return days_gauge(fuel2_days(r), gas30_raw(r), fuel2_color(r), width);
+    double frac = r.lo_target > 0 ? r.fuel2 / r.lo_target : -1;
+    return bar_with_text(two_sided(compact_units(r.fuel2), gas30_raw(r), width), frac,
+                         fuel2_color(r), width);
+}
+
 
 // Parse "2026-07-08T05:00:23..." to time_t (UTC), ignoring fractional/offset.
 static time_t parse_iso(const std::string& s) {
@@ -320,7 +420,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.2.0";
+static const char* STOKER_VERSION = "v2.0.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -397,9 +497,7 @@ static std::string apply_update(const std::string& tag, const std::string& url) 
     auto pkg = dir / "pkg.tar.gz";
 #endif
     auto fresh = dir / exe.filename();  // stoker or stoker-gui, whichever we are
-    run_cmd(("curl -sL " + standalone::curl_flags() + "--max-time 120 -o \"" +
-             pkg.string() + "\" \"" + url + "\"" QUIET).c_str());
-    if (!std::filesystem::exists(pkg) || std::filesystem::file_size(pkg, ec) < 100000)
+if (!standalone::download_file(url, pkg, 100000))
         return "update failed: download incomplete";
     // Windows 10+ ships bsdtar as tar.exe, which also reads zip
     run_cmd(("tar -xf \"" + pkg.string() + "\" -C \"" + dir.string() + "\"" QUIET).c_str());
@@ -674,7 +772,7 @@ static void worker() {
         if (g_standalone)
             standalone_cycle();
         else
-            ingest(run_cmd(g_fetch_cmd.c_str()));
+            ingest(standalone::http_get_body(g_fetch_url));
         if (!update_checked) {
             update_checked = true;
             check_update();
@@ -778,9 +876,9 @@ static bool load_or_setup(bool force_corp) {
                      [](char c) { return c == '"' || c == '\\' || c == '$' || c == '`'; }),
                      s->end());
         std::string url = endpoint + "?k=" + urlenc(key);
-        g_fetch_cmd = "curl -s --compressed --max-time 15 \"" + url + "\"" QUIET;
-        g_refresh_cmd = "curl -s --compressed --max-time 20 \"" + url + "&refresh=1\"" QUIET;
-        g_claim_url = endpoint + "/claim?k=" + key;
+        g_fetch_url = url;
+        g_refresh_url = url + "&refresh=1";
+        g_claim_url = endpoint + "/claim?k=" + urlenc(key);
         return true;
     }
 
@@ -796,6 +894,7 @@ static bool load_or_setup(bool force_corp) {
     return true;
 }
 
+#ifndef STOKER_IMGUI
 // --- main -------------------------------------------------------------------
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -904,7 +1003,8 @@ int main(int argc, char** argv) {
             }
         } else {
             json d = json::object();
-            try { d = json::parse(run_cmd(g_fetch_cmd.c_str())); } catch (...) { d = json::object(); }
+            try { d = json::parse(standalone::http_get_body(g_fetch_url)); }
+            catch (...) { d = json::object(); }
             if (!d.is_object()) d = json::object();
             std::printf("corp endpoint: %d structures\n",
                         (int)d.value("structures", json::array()).size());
@@ -940,7 +1040,7 @@ int main(int argc, char** argv) {
             if (g_standalone)
                 standalone_cycle();
             else
-                ingest(run_cmd(g_refresh_cmd.c_str()));
+                ingest(standalone::http_get_body(g_refresh_url));
             g_busy = false;
             if (g_run) if (g_gui_wake) g_gui_wake();
             else screen.PostEvent(Event::Custom);
@@ -998,11 +1098,10 @@ int main(int argc, char** argv) {
         std::string who = (env && *env) ? env : "";  // backend fills its default
         { std::lock_guard<std::mutex> l(g_mtx); g_status = "filing claim..."; }
         spawn_bg([&, sid, seen_at, who]() {
-            std::string cmd = std::string("curl -s --compressed --max-time 15 -X POST \"") +
-                g_claim_url + "&structure_id=" + std::to_string(sid) + "&by=" + urlenc(who);
-            if (!seen_at.empty()) cmd += "&seen_at=" + urlenc(seen_at);
-            cmd += "\"" QUIET;
-            std::string res = run_cmd(cmd.c_str());
+            std::string url = g_claim_url + "&structure_id=" + std::to_string(sid) +
+                              "&by=" + urlenc(who);
+            if (!seen_at.empty()) url += "&seen_at=" + urlenc(seen_at);
+            std::string res = standalone::http_post_form(url, "");
             std::string note = "claim failed: no reply from the box";
             try {
                 json j = json::parse(res);
@@ -1021,7 +1120,7 @@ int main(int argc, char** argv) {
                 g_note_at = time(nullptr);
                 g_status.clear();
             }
-            ingest(run_cmd(g_fetch_cmd.c_str()));
+            ingest(standalone::http_get_body(g_fetch_url));
             g_busy = false;
             if (g_gui_wake) g_gui_wake();
             else screen.PostEvent(Event::Custom);
@@ -1191,7 +1290,9 @@ int main(int argc, char** argv) {
                     std::snprintf(t, sizeof t, "%.1f days", d.days);
                     std::string ex = d.fuel_expires.empty() ? "" : "  runs out " + d.fuel_expires.substr(0, 16) + " UTC";
                     b.push_back(line("FUEL", hbox({text(t) | color(days_color(d.days)) | bold,
-                                                   text("  " + fuel_bar(d)) | color(days_color(d.days)),
+                                                   text("  "),
+                                                   bar_with_text("", std::max(0.0, d.days / GAUGE_DAYS),
+                                                                 days_color(d.days), 6),
                                                    text(ex) | dim})));
                 } else {
                     b.push_back(line("FUEL", text("no fuel data") | color(Color::RGB(128, 136, 150))));
@@ -1221,7 +1322,7 @@ int main(int argc, char** argv) {
                     b.push_back(line(f2label, d.fuel2 < 0
                         ? text(why) | color(Color::RGB(128, 136, 150))
                         : text(commas(d.fuel2) + " units" +
-                               (d.gas_day > 0 ? "  (~" + commas(d.fuel2 / d.gas_day) + "d at drill rate)" : ""))
+                               (fuel2_days(d) >= 0 ? "  (~" + commas(fuel2_days(d)) + "d at drill rate)" : ""))
                               | color(fuel2_color(d))));
                 }
                 if (d.need >= 0)
@@ -1279,7 +1380,7 @@ int main(int argc, char** argv) {
         int visible = H - 9 - (have_tabs ? 1 : 0);
         if (visible < 3) visible = 3;
         // name column soaks up whatever width is left past the fixed columns
-        int name_w = (log_mode ? W - 60 : W - 68);
+        int name_w = (log_mode ? W - 60 : W - 66);
         if (name_w < 12) name_w = 12;
         if (name_w > 60) name_w = 60;
         bool wide = W >= 105;
@@ -1384,25 +1485,27 @@ int main(int argc, char** argv) {
             // 2ND FUEL = magmatic gas / liquid ozone stock ("?" without a
             // Director-role data source)
             colhead = hbox({
-                text(pad("DAYS", 6, true)), text(" "),
-                text(pad("", 6)), text(" "),
-                text(pad("F", 7, true)), text(" "),
-                text(pad("F²", 9, true)), text("  "),
+                text(" "), text("■") | color(NEON_CYAN), text(pad(" Blocks", 9)),
+                text("30d") | color(INK_GRAY), text(" "),
+                text("●") | color(Color::RGB(235, 90, 60)),
+                text("◆") | color(Color::RGB(120, 190, 255)), text(pad(" Gas/Oz", 8)),
+                text("30d") | color(INK_GRAY), text("  "),
                 text(pad("TYPE", 20)), text("  "),
                 text(pad("SYSTEM", 9)), text("NAME"),
             }) | color(NEON_DIM_CYAN);
             for (int i = offset; i < n && i < offset + visible; i++) {
                 const Row& r = rows[i];
-                Element line = hbox({
-                    text(fuel_label(r)) | color(fuel_color(r)) | bold, text(" "),
-                    text(fuel_bar(r)) | color(fuel_color(r)), text(" "),
-                    text(units_label(r)) | color(need_color(r)) | bold, text(" "),
-                    text(fuel2_label(r)) | color(fuel2_color(r)), text("  "),
+                Element rest = hbox({
                     text(pad(r.type, 20)) | color(Color::RGB(198, 206, 222)), text("  "),
                     text(pad(r.system, 9)) | color(NEON_CYAN),
                     text(pad(r.name, name_w)),
                 });
-                if (i == sel) line = line | inverted;
+                if (i == sel) rest = rest | inverted;
+                Element line = hbox({
+                    fuel_cell(r, 14), text(i == sel ? ">" : " ") | color(NEON_PINK) | bold,
+                    fuel2_cell(r, 14), text("  "),
+                    rest,
+                });
                 body.push_back(line);
             }
             if (n == 0) body.push_back(text("  (no structures match)") | color(Color::RGB(128, 136, 150)));
@@ -1475,7 +1578,7 @@ int main(int argc, char** argv) {
         ke.push_back(filler());
         const char* expl = log_mode
             ? "BLOCKS = deposit estimated from the fuel clock jump "
-            : "F = fuel blocks to 30d - F² = gas/ozone stock (? = needs a Director token) ";
+            : "gauges: days left | haul to 30d on the right (? = needs a Director token) ";
         if (full_fit && W - hints_width(false, true) > (int)std::strlen(expl) + 2)
             ke.push_back(text(expl) | color(INK_GRAY));
         Element keys = hbox(ke);
@@ -1708,3 +1811,4 @@ int main(int argc, char** argv) {
     if (ticker.joinable()) ticker.join();
     return 0;
 }
+#endif  // STOKER_IMGUI

@@ -32,16 +32,12 @@ if(STOKER_STATIC)
   target_link_options(stoker PRIVATE -static)
 endif()
 
-# --- stoker-gui: the same app in a native window (no terminal) -----------------
-# The FTXUI component renders into an off-screen screen drawn with OpenGL;
-# see gui_host.hpp. STOKER_GUI=OFF skips it (e.g. headless build machines).
+# --- stoker-gui: the full Dear ImGui GUI (no terminal) --------------------------
 option(STOKER_GUI "Build the windowed stoker-gui as well" ON)
 if(STOKER_GUI)
   if(MINGW)
-    # cross build: fetch and statically link GLFW (win32 backend, no deps)
     FetchContent_Declare(glfw
-      URL https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
-    )
+      URL https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz)
     set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -53,10 +49,8 @@ if(STOKER_GUI)
     if(glfw3_FOUND)
       set(STOKER_GLFW glfw)
     else()
-      message(STATUS "system glfw3 not found; fetching")
       FetchContent_Declare(glfw
-        URL https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
-      )
+        URL https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz)
       set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
       set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
       set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -66,11 +60,24 @@ if(STOKER_GUI)
     endif()
   endif()
 
-  add_executable(stoker-gui bpos-dash.cpp)
-  target_compile_definitions(stoker-gui PRIVATE STOKER_GUI)
-  target_link_libraries(stoker-gui PRIVATE ftxui::component ftxui::dom ftxui::screen ${STOKER_GLFW})
+  FetchContent_Declare(imgui
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.90.9.tar.gz)
+  FetchContent_MakeAvailable(imgui)
+  add_library(imgui_core STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+  target_include_directories(imgui_core PUBLIC
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(imgui_core PUBLIC ${STOKER_GLFW})
+
+  add_executable(stoker-gui stoker-imgui.cpp)
+  target_link_libraries(stoker-gui PRIVATE
+    ftxui::component ftxui::dom ftxui::screen imgui_core ${STOKER_GLFW})
   if(MINGW)
-    # -mwindows: real windowed app, no console box behind it
     target_link_libraries(stoker-gui PRIVATE opengl32 gdi32 ws2_32 shell32 winhttp)
     target_link_options(stoker-gui PRIVATE -static -mwindows)
   else()
