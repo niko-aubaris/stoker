@@ -239,10 +239,17 @@ static std::string http_get(const std::string& url, const std::string& bearer,
     cmd += "\"" + url + "\"" QUIET;
     std::string raw = run_cmd(cmd.c_str());
     status = 0;
-    size_t sep = raw.find("\r\n\r\n");
-    // skip informational/continuation header blocks (e.g. HTTP/1.1 100)
-    while (sep != std::string::npos && raw.find("HTTP/", sep + 4) == sep + 4)
-        sep = raw.find("\r\n\r\n", sep + 4);
+    const char* seps[] = {"\r\n\r\n", "\n\n"};  // some pipes eat the \r
+    size_t sep = std::string::npos;
+    size_t sw = 4;
+    for (auto* s : seps) {
+        sep = raw.find(s);
+        sw = std::strlen(s);
+        // skip informational/continuation header blocks (e.g. HTTP/1.1 100)
+        while (sep != std::string::npos && raw.find("HTTP/", sep + sw) == sep + sw)
+            sep = raw.find(s, sep + sw);
+        if (sep != std::string::npos) break;
+    }
     if (sep == std::string::npos) return raw;
     std::string hdrs = raw.substr(0, sep);
     if (size_t sp = hdrs.find(' '); sp != std::string::npos)
@@ -263,7 +270,7 @@ static std::string http_get(const std::string& url, const std::string& bearer,
         (*headers_out)["last-modified"] = grab("last-modified");
         (*headers_out)["expires"] = grab("expires");
     }
-    return raw.substr(sep + 4);
+    return raw.substr(sep + sw);
 }
 
 // --- loopback callback listener ----------------------------------------------
@@ -797,9 +804,18 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
         try {
             me = json::parse(http_get(ESI + std::string("/characters/") +
                                           std::to_string(char_id) + "/", "", st));
-        } catch (...) { continue; }
+        } catch (...) {
+            if (first_err.empty())
+                first_err = who + ": cannot reach ESI (is curl installed and the network up?)";
+            continue;
+        }
         long long corp_id = me.value("corporation_id", 0LL);
-        if (!corp_id || std::find(seen.begin(), seen.end(), corp_id) != seen.end())
+        if (!corp_id) {
+            if (first_err.empty())
+                first_err = who + ": ESI lookup failed (HTTP " + std::to_string(st) + ")";
+            continue;
+        }
+        if (std::find(seen.begin(), seen.end(), corp_id) != seen.end())
             continue;
         seen.push_back(corp_id);
 

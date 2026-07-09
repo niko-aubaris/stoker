@@ -153,7 +153,11 @@ static void spawn_bg(F&& fn) {
 // --- helpers ----------------------------------------------------------------
 static std::string run_cmd(const char* cmd) {
     std::string out;
+#ifdef _WIN32
+    FILE* p = popen(cmd, "rb");  // text mode would eat the \r in HTTP headers
+#else
     FILE* p = popen(cmd, "r");
+#endif
     if (!p) return out;
     char buf[8192];
     size_t n;
@@ -705,6 +709,9 @@ int main(int argc, char** argv) {
     const auto app_start = std::chrono::steady_clock::now();
     std::thread th(worker);
     auto screen = ScreenInteractive::Fullscreen();
+    // FTXUI's Cursor::shape is uninitialized by default; force Hidden or the
+    // Windows console cursor flickers at the frame edge on every redraw
+    screen.SetCursor(ftxui::Screen::Cursor{0, 0, ftxui::Screen::Cursor::Hidden});
 
     // view state (main thread)
     int sort_mode = 0;          // 0 fuel, 1 type, 2 system, 3 name, 4 need
