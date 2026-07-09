@@ -216,16 +216,21 @@ static void save_json_file(const std::filesystem::path& p, const json& j) {
 // revocation checks can't complete (AV https-scanning, VPNs, some home
 // routers). When a request comes back empty there, retry once with
 // --ssl-no-revoke and stick with it for the session.
-static bool g_ssl_no_revoke = false;
-static std::string curl_flags() { return g_ssl_no_revoke ? "--ssl-no-revoke " : ""; }
+static std::string g_curl_extra;  // sticky flags that made curl work on this box
+static std::string curl_flags() { return g_curl_extra.empty() ? std::string() : g_curl_extra + " "; }
 
 static std::string run_curl(const std::string& args) {
     std::string out = run_cmd(("curl -s " + curl_flags() + args + QUIET).c_str());
 #ifdef _WIN32
-    if (out.empty() && !g_ssl_no_revoke) {
-        g_ssl_no_revoke = true;
-        out = run_cmd(("curl -s --ssl-no-revoke " + args + QUIET).c_str());
-        if (out.empty()) g_ssl_no_revoke = false;
+    if (out.empty()) {
+        // escalating fallbacks for broken-TLS-interception setups: revocation
+        // checks first (cheap, common), then forcing TLS 1.2 for middleboxes
+        // that fumble the 1.3 handshake
+        for (const char* f : {"--ssl-no-revoke", "--ssl-no-revoke --tlsv1.2 --tls-max 1.2"}) {
+            if (g_curl_extra == f) continue;
+            out = run_cmd(("curl -s " + std::string(f) + " " + args + QUIET).c_str());
+            if (!out.empty()) { g_curl_extra = f; break; }
+        }
     }
 #endif
     return out;
@@ -235,9 +240,16 @@ static std::string run_curl(const std::string& args) {
 static std::string curl_error(const std::string& args) {
     std::string raw = run_cmd(("curl -sS " + curl_flags() + args + " 2>&1").c_str());
     size_t at = raw.find("curl: (");
-    if (at == std::string::npos) return "no reply";
-    size_t end = raw.find('\n', at);
-    return raw.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    std::string msg = "no reply";
+    if (at != std::string::npos) {
+        size_t end = raw.find_first_of("\r\n", at);  // \r would garble the status line
+        msg = raw.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    }
+    // which curl matters when debugging from screenshots
+    std::string ver = run_cmd("curl --version" QUIET);
+    ver = ver.substr(0, ver.find_first_of("\r\n"));
+    if (!ver.empty()) msg += "  [" + ver.substr(0, 48) + "]";
+    return msg;
 }
 
 static std::string http_post_form(const std::string& url, const std::string& body) {
