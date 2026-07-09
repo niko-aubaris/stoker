@@ -9,9 +9,12 @@ Fuel-sorted by default so whatever runs dry first is on top.
 
 ## Running
 
-**Windows:** unzip `stoker-windows-x64.zip`, run `stoker.exe` (Windows
-Terminal looks much better than the legacy console). Needs Windows 10+
-(`curl.exe` ships with the OS).
+**Windows:** unzip `stoker-windows-x64.zip` and double-click `stoker.exe`.
+No terminal or PowerShell needed - Windows opens its own console window
+(Windows Terminal on 11 looks best, the legacy console works too).
+SmartScreen will warn about the unsigned download the first time: choose
+"More info" then "Run anyway" (open-source build, no code-signing cert).
+Needs Windows 10 version 1803+ (`curl.exe` ships with the OS).
 
 **Linux:** untar `stoker-linux-x86_64.tar.gz` and run `./stoker`. Static
 binary, needs only `curl` installed.

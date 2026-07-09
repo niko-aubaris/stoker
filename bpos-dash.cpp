@@ -312,7 +312,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.0.4";
+static const char* STOKER_VERSION = "v1.0.5";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -796,6 +796,23 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("STOKER %s\n", STOKER_VERSION);
         return 0;
+    }
+    // curl is the only external dependency (HTTP for the feed, ESI, SSO, and
+    // updates). Naked Windows ships it since Windows 10 1803; say something
+    // readable instead of a silently empty dashboard when it's missing.
+    if (run_cmd("curl --version" QUIET).rfind("curl", 0) != 0) {
+        std::printf(
+            "STOKER needs curl, which was not found.\n\n"
+#ifdef _WIN32
+            "curl.exe ships with Windows 10 version 1803 (April 2018) and later.\n"
+            "Update Windows, or install curl from https://curl.se/windows/\n"
+#else
+            "Install it with your package manager (e.g. sudo apt install curl).\n"
+#endif
+            "\n[press Enter to close]");
+        std::string pause;
+        std::getline(std::cin, pause);
+        return 1;
     }
     {   // clear the renamed-aside exe a Windows self-update leaves behind
         std::error_code ec;
