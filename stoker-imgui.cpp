@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn("Blocks / 30d", ImGuiTableColumnFlags_WidthFixed, 170);
             ImGui::TableSetupColumn("Gas-Oz / 30d", ImGuiTableColumnFlags_WidthFixed, 170);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 150);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 110);
             ImGui::TableSetupColumn("System", ImGuiTableColumnFlags_WidthFixed, 70);
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();

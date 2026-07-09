@@ -105,6 +105,15 @@ struct Row {
 
 // Types that carry a secondary fuel besides blocks: Metenox drink magmatic
 // gas, gates and cyno beacons burn liquid ozone per jump.
+// Display names: the game's mouthfuls shortened for the table (raw names
+// still drive the fuel2/scope logic and the wire format).
+static std::string display_type(const std::string& t) {
+    if (t == "Metenox Moon Drill") return "Metenox";
+    if (t.rfind("Ansiblex", 0) == 0) return "Jump-Bridge";
+    if (t.rfind("Pharolux", 0) == 0) return "Cyno Bacon";  // yes, bacon
+    return t;
+}
+
 static double fuel2_days(const Row& r) {
     return r.gas_day > 0 && r.fuel2 >= 0 ? r.fuel2 / r.gas_day : -1;
 }
@@ -420,7 +429,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.0.0";
+static const char* STOKER_VERSION = "v2.0.1";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -664,6 +673,7 @@ static void ingest(const std::string& raw) {
         if (s.contains("blocks_to_30d") && !s["blocks_to_30d"].is_null()) r.need = s["blocks_to_30d"].get<double>();
         if (s.contains("m3_to_30d") && !s["m3_to_30d"].is_null()) r.m3 = s["m3_to_30d"].get<double>();
         r.fuel2_name = fuel2_kind(r.type);
+        r.type = display_type(r.type);
         if (s.contains("fuel2_units") && !s["fuel2_units"].is_null())
             r.fuel2 = s["fuel2_units"].get<double>();
         auto numf = [&s](const char* k) -> double {
@@ -1380,7 +1390,7 @@ int main(int argc, char** argv) {
         int visible = H - 9 - (have_tabs ? 1 : 0);
         if (visible < 3) visible = 3;
         // name column soaks up whatever width is left past the fixed columns
-        int name_w = (log_mode ? W - 60 : W - 66);
+        int name_w = (log_mode ? W - 60 : W - 58);
         if (name_w < 12) name_w = 12;
         if (name_w > 60) name_w = 60;
         bool wide = W >= 105;
@@ -1490,13 +1500,13 @@ int main(int argc, char** argv) {
                 text("●") | color(Color::RGB(235, 90, 60)),
                 text("◆") | color(Color::RGB(120, 190, 255)), text(pad(" Gas/Oz", 8)),
                 text("30d") | color(INK_GRAY), text("  "),
-                text(pad("TYPE", 20)), text("  "),
+                text(pad("TYPE", 12)), text("  "),
                 text(pad("SYSTEM", 9)), text("NAME"),
             }) | color(NEON_DIM_CYAN);
             for (int i = offset; i < n && i < offset + visible; i++) {
                 const Row& r = rows[i];
                 Element rest = hbox({
-                    text(pad(r.type, 20)) | color(Color::RGB(198, 206, 222)), text("  "),
+                    text(pad(r.type, 12)) | color(Color::RGB(198, 206, 222)), text("  "),
                     text(pad(r.system, 9)) | color(NEON_CYAN),
                     text(pad(r.name, name_w)),
                 });
