@@ -43,6 +43,11 @@ Privacy switch: set `"history_api": ""` in config.json to disable, or
 point it at your own server (two endpoints: `POST /report`,
 `GET /refuels?corp_id=`; see the STOKER backend source).
 
+**Updates:** on startup STOKER checks the newest GitHub release once; if
+a newer version exists the header offers it and `u` downloads and swaps
+the binary in place (restart to run it). Set `"update_check": false` in
+config.json to disable.
+
 **Multiple corps:** press `alt+c` in the app (or run `stoker --add`) to log
 in another character. Every corp your characters can read gets its own tab
 (labeled by corp ticker); press `c` to switch. With access to just one corp there is no tab bar,

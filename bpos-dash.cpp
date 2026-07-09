@@ -305,6 +305,129 @@ static time_t parse_iso(const std::string& s) {
 }
 
 #include "standalone.hpp"  // needs run_cmd/urlenc/parse_iso above
+
+// --- self-update against GitHub releases --------------------------------------
+// Startup checks the latest release once (config "update_check": false skips);
+// when a newer tag exists the header offers [u], which downloads the matching
+// platform asset and swaps it over the running binary (Windows: the running
+// exe is renamed aside first, and the leftover .old is removed on next start).
+static const char* STOKER_VERSION = "v1.0.3";
+static const char* UPDATE_REPO = "niko-aubaris/stoker";
+static bool g_update_check = true;
+static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
+
+static bool ver_newer(const std::string& a, const std::string& b) {
+    // dotted-number compare, "v1.0.10" style; true when a > b
+    auto nums = [](const std::string& s) {
+        std::vector<long> v;
+        long cur = -1;
+        for (char c : s) {
+            if (c >= '0' && c <= '9') cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
+            else if (cur >= 0) { v.push_back(cur); cur = -1; }
+        }
+        if (cur >= 0) v.push_back(cur);
+        return v;
+    };
+    auto va = nums(a), vb = nums(b);
+    for (size_t i = 0; i < std::max(va.size(), vb.size()); i++) {
+        long x = i < va.size() ? va[i] : 0, y = i < vb.size() ? vb[i] : 0;
+        if (x != y) return x > y;
+    }
+    return false;
+}
+
+static void check_update() {
+    if (!g_update_check) return;
+    int st = 0;
+    json j;
+    try {
+        j = json::parse(standalone::http_get(
+            "https://api.github.com/repos/" + std::string(UPDATE_REPO) +
+                "/releases/latest", "", st));
+    } catch (...) { return; }
+    if (st != 200 || !j.is_object()) return;
+    std::string tag = j.value("tag_name", "");
+    if (tag.empty() || !ver_newer(tag, STOKER_VERSION)) return;
+#ifdef _WIN32
+    const char* want = "windows-x64.zip";
+#else
+    const char* want = "linux-x86_64.tar.gz";
+#endif
+    for (auto& a : j.value("assets", json::array())) {
+        if (a.value("name", std::string()).find(want) == std::string::npos) continue;
+        std::lock_guard<std::mutex> l(g_mtx);
+        g_update_tag = tag;
+        g_update_url = a.value("browser_download_url", "");
+        return;
+    }
+}
+
+static std::filesystem::path own_exe() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    return n ? std::filesystem::path(buf) : std::filesystem::path();
+#else
+    std::error_code ec;
+    auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::filesystem::path() : p;
+#endif
+}
+
+// Download + swap. Returns the note-line text; never throws.
+static std::string apply_update(const std::string& tag, const std::string& url) try {
+    auto exe = own_exe();
+    if (exe.empty()) return "update failed: cannot locate own executable";
+    auto dir = standalone::config_dir() / "update";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+#ifdef _WIN32
+    auto pkg = dir / "pkg.zip";
+    auto fresh = dir / "stoker.exe";
+#else
+    auto pkg = dir / "pkg.tar.gz";
+    auto fresh = dir / "stoker";
+#endif
+    run_cmd(("curl -sL --max-time 120 -o \"" + pkg.string() + "\" \"" + url + "\"" QUIET).c_str());
+    if (!std::filesystem::exists(pkg) || std::filesystem::file_size(pkg, ec) < 100000)
+        return "update failed: download incomplete";
+    // Windows 10+ ships bsdtar as tar.exe, which also reads zip
+    run_cmd(("tar -xf \"" + pkg.string() + "\" -C \"" + dir.string() + "\"" QUIET).c_str());
+    if (!std::filesystem::exists(fresh))
+        return "update failed: archive did not contain the binary";
+#ifndef _WIN32
+    std::filesystem::permissions(fresh,
+        std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+        std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+        std::filesystem::perms::others_exec, ec);
+#endif
+    // stage beside the running binary so the final rename is same-filesystem
+    auto staged = exe;
+    staged += ".new";
+    std::filesystem::copy_file(fresh, staged,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec)
+        return "update failed: cannot write in " + exe.parent_path().string();
+#ifdef _WIN32
+    auto old = exe;
+    old += ".old";
+    std::filesystem::remove(old, ec);
+    if (!MoveFileExA(exe.string().c_str(), old.string().c_str(), MOVEFILE_REPLACE_EXISTING))
+        return "update failed: cannot move the running exe aside";
+    if (!MoveFileExA(staged.string().c_str(), exe.string().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExA(old.string().c_str(), exe.string().c_str(), MOVEFILE_REPLACE_EXISTING);
+        return "update failed: cannot move the new exe in place";
+    }
+#else
+    std::filesystem::rename(staged, exe, ec);
+    if (ec) return "update failed: cannot replace the binary";
+#endif
+    std::filesystem::remove_all(dir, ec);
+    return "updated to " + tag + " - restart STOKER to run it";
+} catch (const std::exception& e) {
+    return std::string("update failed: ") + e.what();
+}
 #include "splash_frames.hpp"
 
 static std::string rel_age(const std::string& iso) {
@@ -535,11 +658,16 @@ static void standalone_cycle() {
 }
 
 static void worker() {
+    bool update_checked = false;
     while (g_run) {
         if (g_standalone)
             standalone_cycle();
         else
             ingest(run_cmd(g_fetch_cmd.c_str()));
+        if (!update_checked) {
+            update_checked = true;
+            check_update();
+        }
         const int secs = g_standalone ? ESI_REFRESH_SECONDS : REFRESH_SECONDS;
         for (int i = 0; i < secs * 4 && g_run; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -582,6 +710,8 @@ static bool load_or_setup(bool force_corp) {
         standalone::g_scopes = cfg["scopes"].get<std::string>();
     if (cfg.contains("history_api") && cfg["history_api"].is_string())
         standalone::g_history_api = cfg["history_api"].get<std::string>();
+    if (cfg.contains("update_check") && cfg["update_check"].is_boolean())
+        g_update_check = cfg["update_check"].get<bool>();
     if (cfg.contains("tab_type_filter") && cfg["tab_type_filter"].is_object())
         for (auto& [k, v] : cfg["tab_type_filter"].items())
             if (v.is_string()) g_tab_default_filter[k] = v.get<std::string>();
@@ -661,6 +791,18 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+    if (argc > 1 && std::string(argv[1]) == "--version") {
+        std::printf("STOKER %s\n", STOKER_VERSION);
+        return 0;
+    }
+    {   // clear the renamed-aside exe a Windows self-update leaves behind
+        std::error_code ec;
+        auto old_exe = own_exe();
+        if (!old_exe.empty()) {
+            old_exe += ".old";
+            std::filesystem::remove(old_exe, ec);
+        }
+    }
     const bool force_corp = argc > 1 && std::string(argv[1]) == "--corp";
     const bool add_char = argc > 1 && std::string(argv[1]) == "--add";
     if (!load_or_setup(force_corp)) {
@@ -896,7 +1038,7 @@ int main(int argc, char** argv) {
         std::vector<Refuel> refuels;
         std::vector<std::string> tabs;
         int total, under14, under7, tabsel;
-        std::string pulled, status, esiMod, esiExp, note;
+        std::string pulled, status, esiMod, esiExp, note, upd;
         {
             std::lock_guard<std::mutex> l(g_mtx);
             total = (int)g_rows.size();
@@ -907,6 +1049,7 @@ int main(int argc, char** argv) {
             esiExp = g_esi_expires;
             tabs = g_tab_labels;
             tabsel = g_tab;
+            upd = g_update_tag;
             if (g_note_at && time(nullptr) - g_note_at < 20) note = g_note;
         }
         const bool have_tabs = tabs.size() > 1;
@@ -1077,8 +1220,11 @@ int main(int argc, char** argv) {
         Element head = hbox({
             text(" ▌") | color(NEON_PINK),
             text("STOKER") | bold | color(NEON_PINK),
-            text(log_mode ? " » refuel log " : " » BPOS fuel watch ") | color(NEON_DIM_CYAN),
+            text(std::string(" ") + STOKER_VERSION + " ") | color(INK_GRAY),
+            text(log_mode ? "» refuel log " : "» BPOS fuel watch ") | color(NEON_DIM_CYAN),
             text(g_standalone ? "[standalone] " : "[corp] ") | color(INK_GRAY),
+            (upd.empty() ? text("")
+                         : text(" " + upd + " available - press u ") | color(Color::RGB(250, 215, 70))),
             text(std::to_string(n) + "/" + std::to_string(total)) | color(INK_GRAY),
             filler(),
             text("under14d ") | color(INK_GRAY),
@@ -1228,6 +1374,7 @@ int main(int argc, char** argv) {
             {"c", "corp", "corp", have_tabs},
             {"alt+c", "add character", "add", g_standalone},
             {"1", "I fueled it", "claim", !g_standalone},
+            {"u", "update", "upd", !upd.empty()},
             {"r", "refresh", "rfsh", true},
             {"q", "quit", "quit", true},
         };
@@ -1374,6 +1521,34 @@ int main(int argc, char** argv) {
             return true;
         }
         if (e == Event::Character("/")) { filter_mode = true; return true; }
+        if (e == Event::Character("u")) {  // apply a pending self-update
+            std::string tag, url;
+            {
+                std::lock_guard<std::mutex> l(g_mtx);
+                tag = g_update_tag;
+                url = g_update_url;
+            }
+            if (!tag.empty() && !g_busy) {
+                g_busy = true;
+                {
+                    std::lock_guard<std::mutex> l(g_mtx);
+                    g_status = "downloading " + tag + "...";
+                }
+                spawn_bg([&, tag, url]() {
+                    std::string res = apply_update(tag, url);
+                    {
+                        std::lock_guard<std::mutex> l(g_mtx);
+                        g_note = res;
+                        g_note_at = time(nullptr);
+                        g_status = "";
+                        if (res.rfind("updated", 0) == 0) g_update_tag.clear();
+                    }
+                    g_busy = false;
+                    if (g_run) screen.PostEvent(Event::Custom);
+                });
+            }
+            return true;
+        }
         if (e == Event::Character("c")) {  // cycle corp tabs (standalone, >1 corp)
             std::string data;
             int oldtab = 0, newtab = 0;
