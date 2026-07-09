@@ -13,6 +13,122 @@
 #include "font_dejavu_mono.hpp"
 #include "icons_data.hpp"
 #include "window_icon_data.hpp"
+#include "jumpmap_data.hpp"
+#include <regex>
+
+// --- the map (same layout as eveterm: DOTLAN region SVG positions + the
+// embedded New Eden gate graph) -------------------------------------------------
+struct MapNode { int id = 0; std::string label; double nx = 0, ny = 0; };
+struct MapView {
+    std::string region, error;
+    bool loading = false, ok = false;
+    std::vector<MapNode> nodes;
+    std::vector<std::pair<int, int>> gates;
+    float zoom = 1.0f;
+    ImVec2 pan{0.5f, 0.5f};  // normalized center
+    int selected = -1;
+};
+static MapView g_map;               // guarded by g_mtx for the built data
+static std::map<int, std::vector<int>> g_adj;
+static std::map<int, std::string> g_sysname;
+static std::map<std::string, int> g_sysid;
+
+static void load_universe() {
+    if (!g_adj.empty()) return;
+    try {
+        json j = json::parse(std::string((const char*)kJumpmapJson, kJumpmapSize));
+        for (auto& [k, v] : j["names"].items()) {
+            int id = std::atoi(k.c_str());
+            std::string nm = v.get<std::string>();
+            g_sysname[id] = nm;
+            for (auto& c : nm) c = (char)tolower((unsigned char)c);
+            g_sysid[nm] = id;
+        }
+        for (auto& [k, v] : j["adj"].items()) {
+            int id = std::atoi(k.c_str());
+            for (auto& n : v) g_adj[id].push_back(n.get<int>());
+        }
+    } catch (...) {}
+}
+
+static void act_build_map(std::string region) {
+    {
+        std::lock_guard<std::mutex> l(g_mtx);
+        if (g_map.loading) return;
+        g_map.loading = true;
+        g_map.error.clear();
+    }
+    spawn_bg([region]() {
+        load_universe();
+        std::string slug = region;
+        for (auto& c : slug)
+            if (c == ' ') c = '_';
+        std::string svg = standalone::http_get_body("https://evemaps.dotlan.net/svg/" + slug + ".svg");
+        MapView m;
+        m.region = region;
+        static const std::regex re(R"RE(id="sys([0-9]+)"\s+x="([0-9.]+)"\s+y="([0-9.]+)")RE");
+        std::map<int, int> idx;
+        double minx = 1e18, miny = 1e18, maxx = -1e18, maxy = -1e18;
+        for (auto it = std::sregex_iterator(svg.begin(), svg.end(), re);
+             it != std::sregex_iterator(); ++it) {
+            int id = std::stoi((*it)[1]);
+            if (idx.count(id)) continue;
+            double x = std::stod((*it)[2]) + 31.0, y = std::stod((*it)[3]) + 15.0;
+            idx[id] = (int)m.nodes.size();
+            m.nodes.push_back({id, g_sysname.count(id) ? g_sysname[id] : std::to_string(id), x, y});
+            minx = std::min(minx, x); maxx = std::max(maxx, x);
+            miny = std::min(miny, y); maxy = std::max(maxy, y);
+        }
+        if (m.nodes.empty()) {
+            m.error = "no systems parsed for '" + region + "' (check the region name)";
+        } else {
+            double sx = maxx > minx ? maxx - minx : 1, sy = maxy > miny ? maxy - miny : 1;
+            for (auto& n : m.nodes) { n.nx = (n.nx - minx) / sx; n.ny = (n.ny - miny) / sy; }
+            for (auto& kv : idx)
+                for (int nb : g_adj.count(kv.first) ? g_adj[kv.first] : std::vector<int>{})
+                    if (kv.first < nb && idx.count(nb))
+                        m.gates.push_back({kv.second, idx.at(nb)});
+            m.ok = true;
+        }
+        std::lock_guard<std::mutex> l(g_mtx);
+        std::string keep_err = m.error;
+        m.loading = false;
+        g_map = std::move(m);
+        if (g_gui_wake) g_gui_wake();
+    });
+}
+
+// EVE autopilot: set the in-game destination with the first login that has
+// the waypoint scope (needs one re-login after v2.1 to grant it).
+static void act_set_destination(int system_id, const std::string& sysname) {
+    spawn_bg([system_id, sysname]() {
+        std::string note = "set destination needs a standalone EVE login";
+        if (g_standalone) {
+            json chars = standalone::load_characters();
+            note = "no login has the waypoint permission - press + add character to re-login";
+            for (size_t i = 0; i < chars.size(); i++) {
+                std::string tok = standalone::ensure_token_entry(g_client_id, chars, i);
+                if (tok.empty() ||
+                    !standalone::token_has_scope(tok, "esi-ui.write_waypoint.v1"))
+                    continue;
+                int st = 0;
+                standalone::http_post_auth(
+                    "https://esi.evetech.net/latest/ui/autopilot/waypoint/"
+                    "?add_to_beginning=false&clear_other_waypoints=true&destination_id=" +
+                        std::to_string(system_id) + "&datasource=tranquility",
+                    tok, st);
+                note = st == 204 ? "destination set: " + sysname + " (" +
+                                       chars[i].value("character_name", std::string()) + ")"
+                                 : "set destination failed (HTTP " + std::to_string(st) + ")";
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> l(g_mtx);
+        g_note = note;
+        g_note_at = time(nullptr);
+        if (g_gui_wake) g_gui_wake();
+    });
+}
 
 // --- theme -------------------------------------------------------------------
 static const ImVec4 PINK(1.00f, 0.17f, 0.84f, 1), CYAN_(0.00f, 0.90f, 1.00f, 1),
@@ -325,6 +441,135 @@ int main(int argc, char** argv) {
             ImGui::EndTabBar();
         }
 
+        static int mode = 0;
+        ImGui::RadioButton("Fuel", &mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Map", &mode, 1);
+        ImGui::SameLine();
+        ImGui::TextColored(GREY_, " ");
+        ImGui::SameLine();
+
+        if (mode == 1) {
+            static char region[64] = {0};
+            MapView mv;
+            {
+                std::lock_guard<std::mutex> l(g_mtx);
+                mv = g_map;
+            }
+            ImGui::SetNextItemWidth(220);
+            bool go = ImGui::InputTextWithHint("##region", "region (e.g. Querious)", region,
+                                               sizeof region, ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if ((ImGui::Button("load map") || go) && region[0]) act_build_map(region);
+            ImGui::SameLine();
+            if (mv.loading) ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1), "fetching DOTLAN layout...");
+            else if (!mv.error.empty()) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", mv.error.c_str());
+            else if (mv.ok) ImGui::TextColored(GREY_, "%s: %d systems - wheel zooms, drag pans, click selects", mv.region.c_str(), (int)mv.nodes.size());
+
+            // structures per system for highlights + the side panel
+            std::map<std::string, std::vector<const Row*>> by_sys;
+            for (auto& r : rows) by_sys[r.system].push_back(&r);
+
+            ImGui::BeginChild("map", ImVec2(ImGui::GetContentRegionAvail().x * 0.75f, 0), true);
+            {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                ImVec2 sz = ImGui::GetContentRegionAvail();
+                ImGui::InvisibleButton("mapcanvas", sz);
+                bool hovered = ImGui::IsItemHovered();
+                auto& io2 = ImGui::GetIO();
+                static MapView* live = nullptr;  // pan/zoom act on the shared state
+                {
+                    std::lock_guard<std::mutex> l(g_mtx);
+                    live = &g_map;
+                    if (hovered && io2.MouseWheel != 0) {
+                        float f = io2.MouseWheel > 0 ? 1.25f : 0.8f;
+                        live->zoom = std::clamp(live->zoom * f, 1.0f, 14.0f);
+                    }
+                    if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                        ImVec2 d = io2.MouseDelta;
+                        live->pan.x -= d.x / (live->zoom * sz.x);
+                        live->pan.y -= d.y / (live->zoom * sz.y);
+                    }
+                    mv = *live;
+                }
+                auto at = [&](const MapNode& n) {
+                    return ImVec2(p0.x + sz.x * 0.5f + (float)(n.nx - mv.pan.x) * mv.zoom * sz.x,
+                                  p0.y + sz.y * 0.5f + (float)(n.ny - mv.pan.y) * mv.zoom * sz.y);
+                };
+                for (auto& g : mv.gates)
+                    dl->AddLine(at(mv.nodes[g.first]), at(mv.nodes[g.second]),
+                                IM_COL32(70, 74, 92, 255));
+                int clicked = -1;
+                for (int i = 0; i < (int)mv.nodes.size(); i++) {
+                    ImVec2 q = at(mv.nodes[i]);
+                    if (q.x < p0.x - 30 || q.x > p0.x + sz.x + 30 || q.y < p0.y - 10 ||
+                        q.y > p0.y + sz.y + 10)
+                        continue;
+                    auto bs = by_sys.find(mv.nodes[i].label);
+                    ImU32 dot = IM_COL32(160, 168, 190, 255);
+                    if (bs != by_sys.end()) {
+                        int worst = 3;
+                        for (auto* r : bs->second)
+                            if (r->has_fuel) worst = std::min(worst, urgency_band(r->days));
+                        dot = band_u32(worst);
+                        dl->AddCircle(q, 7.0f, dot, 0, 2.0f);
+                    }
+                    bool selq = mv.selected == i;
+                    dl->AddCircleFilled(q, selq ? 4.5f : 3.0f, selq ? IM_COL32(0, 229, 255, 255) : dot);
+                    dl->AddText(ImVec2(q.x + 6, q.y - 7),
+                                selq ? IM_COL32(0, 229, 255, 255) : IM_COL32(200, 206, 222, 255),
+                                mv.nodes[i].label.c_str());
+                    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        ImVec2 mp = io2.MousePos;
+                        float dx = mp.x - q.x, dy = mp.y - q.y;
+                        if (dx * dx + dy * dy < 12 * 12) clicked = i;
+                    }
+                }
+                if (clicked >= 0) {
+                    std::lock_guard<std::mutex> l(g_mtx);
+                    g_map.selected = clicked;
+                }
+            }
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("mapside", ImVec2(0, 0), true);
+            if (mv.selected >= 0 && mv.selected < (int)mv.nodes.size()) {
+                const MapNode& n = mv.nodes[mv.selected];
+                ImGui::TextColored(CYAN_, "%s", n.label.c_str());
+                if (ImGui::Button("set destination")) act_set_destination(n.id, n.label);
+                ImGui::Separator();
+                auto bs = by_sys.find(n.label);
+                if (bs == by_sys.end()) {
+                    ImGui::TextColored(GREY_, "no tracked structures here");
+                } else {
+                    for (auto* r : bs->second) {
+                        char db2[32];
+                        std::snprintf(db2, sizeof db2, "%.1fd", r->days);
+                        gauge(("m" + std::to_string(r->sid)).c_str(),
+                              r->has_fuel ? r->days / GAUGE_DAYS : -1,
+                              r->has_fuel ? urgency_band(r->days) : -1,
+                              r->has_fuel ? db2 : "--", "", ImGui::GetContentRegionAvail().x - 4);
+                        ImGui::TextColored(GREY_, "%s", r->name.c_str());
+                        ImGui::Spacing();
+                    }
+                }
+            } else {
+                ImGui::TextColored(GREY_, "click a system");
+            }
+            ImGui::EndChild();
+            ImGui::End();
+            ImGui::Render();
+            int w2, h2;
+            glfwGetFramebufferSize(win, &w2, &h2);
+            glViewport(0, 0, w2, h2);
+            glClearColor(0.055f, 0.055f, 0.09f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(win);
+            continue;
+        }
+
         // filter
         ImGui::SetNextItemWidth(260);
         ImGui::InputTextWithHint("##filter", "filter name/system/type", filter, sizeof filter);
@@ -501,6 +746,14 @@ int main(int argc, char** argv) {
                     if (d->has_refuel)
                         ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.51f, 1), "last fueled %s (+%.1fd)",
                                            rel_age(d->last_refuel).c_str(), d->refuel_added);
+                    {
+                        std::string ls = d->system;
+                        for (auto& c : ls) c = (char)tolower((unsigned char)c);
+                        load_universe();
+                        auto sit = g_sysid.find(ls);
+                        if (sit != g_sysid.end() && ImGui::Button("set destination"))
+                            act_set_destination(sit->second, d->system);
+                    }
                     if (!g_standalone) {
                         ImGui::Separator();
                         if (ImGui::Button("I fueled this structure")) act_claim(d->sid);

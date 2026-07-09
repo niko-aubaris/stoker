@@ -148,7 +148,8 @@ static const char* ESI = "https://esi.evetech.net/latest";
 // "?"). Overridable via config.json "scopes", e.g. to trim back to
 // structures-only.
 static const char* SCOPE =
-    "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1";
+    "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
+    "esi-ui.write_waypoint.v1";
 static std::string g_scopes = SCOPE;
 // Refuel-history service: standalone clients have no storage, so each poll
 // reports its snapshot here and reads back the refuel log the server builds
@@ -426,6 +427,21 @@ static std::string curl_error(const std::string& args) {
 // body-only GET for callers that don't care about the status code
 static std::string http_get(const std::string& url, const std::string& bearer,
                             int& status, json* headers_out);
+static std::string http_post_auth(const std::string& url, const std::string& bearer,
+                                  int& status) {
+    status = 0;
+#ifdef _WIN32
+    std::string out;
+    int st = winhttp_req(url, L"POST", bearer, "", nullptr, out, nullptr);
+    if (st > 0) { status = st; return out; }
+#endif
+    std::string raw = run_curl("-i --max-time 20 -X POST -H \"Authorization: Bearer " +
+                               bearer + "\" \"" + url + "\"");
+    size_t sp = raw.find(' ');
+    if (sp != std::string::npos) status = std::atoi(raw.c_str() + sp);
+    return raw;
+}
+
 static std::string http_get_body(const std::string& url) {
     int st = 0;
     return http_get(url, "", st, nullptr);
