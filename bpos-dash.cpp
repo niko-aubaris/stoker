@@ -133,6 +133,7 @@ static int g_tab = 0;
 static std::map<std::string, std::string> g_tab_default_filter;
 static std::string g_pulled_at;
 static std::string g_corp_name;  // whose structures the active feed shows
+static std::string g_fuel2_status;  // ok|relogin|director|error|off - why F² has data or not
 static std::string g_esi_lastmod, g_esi_expires;  // CCP regenerates hourly
 static std::string g_status = "connecting to the box...";
 static std::string g_note;         // last claim result, shown for a few seconds
@@ -312,7 +313,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.0.5";
+static const char* STOKER_VERSION = "v1.0.6";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -628,6 +629,7 @@ static void ingest(const std::string& raw) {
     g_refuels = std::move(refuels);
     g_pulled_at = d.value("pulled_at", "");
     g_corp_name = d.value("corp", "");
+    g_fuel2_status = d.value("fuel2_status", "");
     g_esi_lastmod = d.contains("esi_last_modified") && !d["esi_last_modified"].is_null()
                         ? d["esi_last_modified"].get<std::string>() : "";
     g_esi_expires = d.contains("esi_expires") && !d["esi_expires"].is_null()
@@ -854,7 +856,8 @@ int main(int argc, char** argv) {
                 json d;
                 try { d = json::parse(s.data); } catch (...) {}
                 std::string line = (s.label.empty() ? std::string("(no corp)") : s.label) + ": " +
-                    std::to_string(d.value("structures", json::array()).size()) + " structures";
+                    std::to_string(d.value("structures", json::array()).size()) + " structures" +
+                    "  F2: " + d.value("fuel2_status", "?");
                 if (d.contains("error")) line += "  error: " + d.value("error", "");
                 std::printf("%s\n", line.c_str());
             }
@@ -1163,8 +1166,15 @@ int main(int argc, char** argv) {
                     b.push_back(line("IN BAY", text("~" + commas(d.blocks_now) + " blocks (" + commas(d.m3_now) + " m3), est from fuel clock x rate") | color(Color::RGB(90, 225, 130))));
                 if (!d.fuel2_name.empty()) {
                     const char* f2label = d.fuel2_name == "Magmatic Gas" ? "MAGMATIC GAS" : "OZONE";
+                    std::string f2s;
+                    { std::lock_guard<std::mutex> lf(g_mtx); f2s = g_fuel2_status; }
+                    std::string why = f2s == "relogin"
+                        ? "unknown - this login predates the corp-assets permission: alt+c and log in again"
+                        : f2s == "director" ? "unknown - your character needs the in-game Director role"
+                        : f2s == "error" ? "unknown - the corp-assets pull failed, retrying next poll"
+                        : "unknown (needs a Director-role data source)";
                     b.push_back(line(f2label, d.fuel2 < 0
-                        ? text("unknown (needs a Director-role token)") | color(Color::RGB(128, 136, 150))
+                        ? text(why) | color(Color::RGB(128, 136, 150))
                         : text(commas(d.fuel2) + " units" +
                                (d.gas_day > 0 ? "  (~" + commas(d.fuel2 / d.gas_day) + "d at drill rate)" : ""))
                               | color(fuel2_color(d))));

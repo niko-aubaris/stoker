@@ -523,6 +523,21 @@ static std::string ensure_token_entry(const std::string& client_id, json& chars,
     return t["access_token"];
 }
 
+// Scopes ride in the access token's JWT "scp" claim; a token minted before
+// a scope was added to the request never has it (relogin required).
+static bool token_has_scope(const std::string& tok, const std::string& scope) {
+    size_t d1 = tok.find('.'), d2 = tok.find('.', d1 + 1);
+    if (d1 == std::string::npos || d2 == std::string::npos) return false;
+    try {
+        json pl = json::parse(b64url_decode(tok.substr(d1 + 1, d2 - d1 - 1)));
+        if (!pl.contains("scp")) return false;
+        if (pl["scp"].is_string()) return pl["scp"].get<std::string>() == scope;
+        for (auto& s : pl["scp"])
+            if (s.is_string() && s.get<std::string>() == scope) return true;
+    } catch (...) {}
+    return false;
+}
+
 static bool have_login() {
     json chars = load_characters();
     for (auto& c : chars)
@@ -656,7 +671,11 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     // anything short of that 403s and the column shows "?".
     std::map<long long, double> gas_at, ozone_at;
     bool assets_ok = false;
-    if (g_scopes.find("read_corporation_assets") != std::string::npos) {
+    std::string fuel2_status = "off";  // ok | relogin | director | error | off
+    if (!token_has_scope(tok, "esi-assets.read_corporation_assets.v1")) {
+        if (g_scopes.find("read_corporation_assets") != std::string::npos)
+            fuel2_status = "relogin";  // we ask for it now; this token predates that
+    } else {
         json ahdr = json::object();
         for (int page = 1, pages = 1; page <= pages && page <= 40; page++) {
             json* h = page == 1 ? &ahdr : nullptr;
@@ -665,7 +684,8 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                                             "/assets/?datasource=tranquility&page=" +
                                             std::to_string(page),
                                         tok, st, h);
-            if (st != 200) break;
+            if (st == 403) { fuel2_status = "director"; break; }
+            if (st != 200) { fuel2_status = "error"; break; }
             json j;
             try { j = json::parse(body); } catch (...) { break; }
             if (!j.is_array()) break;
@@ -681,6 +701,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             if (page == 1 && ahdr.value("x-pages", std::string()) != "")
                 pages = std::atoi(ahdr["x-pages"].get<std::string>().c_str());
         }
+        if (assets_ok) fuel2_status = "ok";
     }
 
     time_t now = time(nullptr);
@@ -695,6 +716,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
 
     json out;
     out["corp"] = corp_display;  // the header brands itself with this
+    out["fuel2_status"] = fuel2_status;
     out["pulled_at"] = now_iso;
     std::string lm = http_date_to_iso(hdr.value("last-modified", std::string()));
     std::string ex = http_date_to_iso(hdr.value("expires", std::string()));
