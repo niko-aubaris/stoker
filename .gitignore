@@ -1,0 +1,10 @@
+build/
+build-linux/
+build-win/
+stoker
+bpos-dash
+*.o
+dist/
+bpos-dash.desktop
+art/
+stoker-icon-src.png

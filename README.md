@@ -1,0 +1,90 @@
+# STOKER
+
+Live terminal fuel-watch dashboard for EVE Online Upwell structures.
+A stoker keeps the furnaces fed; so does this.
+
+![terminal app](bpos-dash.svg)
+
+Fuel-sorted by default so whatever runs dry first is on top.
+
+## Running
+
+**Windows:** unzip `stoker-windows-x64.zip`, run `stoker.exe` (Windows
+Terminal looks much better than the legacy console). Needs Windows 10+
+(`curl.exe` ships with the OS).
+
+**Linux:** untar `stoker-linux-x86_64.tar.gz` and run `./stoker`. Static
+binary, needs only `curl` installed.
+
+First run opens your browser for an EVE login; approve the single
+(read-only) structure permission and the dashboard appears. That's the
+whole setup: the refresh token is kept locally so it's a one-time dance.
+Your character needs the **Station_Manager** (or Director) in-game role,
+or ESI refuses the corp structure list.
+
+Standalone (EVE login) mode shows name / system / type / state / services /
+fuel days for every corp structure. The 2ND FUEL column (Magmatic Gas on
+Metenox drills, Liquid Ozone on Ansiblex gates and Pharolux beacons) reads
+the structure fuel bay from corp assets, which needs two extras: your dev
+app must allow the `esi-assets.read_corporation_assets.v1` scope, your
+config.json must request it (`"scopes": "esi-corporations.read_structures.v1
+esi-assets.read_corporation_assets.v1"`), and the character needs the
+in-game Director role. Anything short of that shows "?". Burn rates, bay estimates and the
+refuel log are computed server-side by a hosted STOKER backend and show as
+unknown without one.
+
+**Multiple corps:** press `alt+c` in the app (or run `stoker --add`) to log
+in another character. Every corp your characters can read gets its own tab
+(labeled by corp ticker); press `c` to switch. With access to just one corp there is no tab bar,
+the dashboard looks exactly as before. Two characters in the same corp
+share one tab, and a character without the in-game role simply
+contributes nothing.
+
+### Corp mode
+
+If whoever hosts a STOKER backend gave you an endpoint URL and access key,
+run `stoker --corp` once and paste them in. Full feature set: usage-based
+burn rates, bay estimates, refuel log, refuel claims, doctrine ozone tiers.
+Settings live in `~/.config/stoker/config.json` (Windows:
+`%APPDATA%\stoker\config.json`); env overrides `STOKER_ENDPOINT`,
+`STOKER_KEY`, `STOKER_CLIENT_ID`.
+
+Set the `STOKER_NAME` environment variable so `[1]` refuel claims are
+stamped as you (corp mode only).
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| up/down, pgup/pgdn, wheel | scroll |
+| tab | cycle structure-type filter |
+| s | cycle sort (fuel / type / system / name / need) |
+| / | text filter (Enter apply, Esc clear) |
+| f | refuel log |
+| c | switch corp tab (when more than one corp is visible) |
+| alt+c | add another character (standalone) |
+| right arrow | detail page for selected structure (left/Esc back) |
+| 1 | "I fueled this" claim on the selected refuel event (corp mode) |
+| r | request a fresh pull |
+| q | quit |
+
+## Building
+
+Portable build via CMake (fetches FTXUI v5.0.0 automatically):
+
+    cmake -S . -B build && cmake --build build -j
+
+Release packages for both platforms (needs `g++-mingw-w64-x86-64-posix`
+for the Windows cross build):
+
+    ./build-release.sh
+
+## Notes
+
+- No secrets ship in the source or release binaries. Corp-mode keys live in your
+  local config file; standalone uses EVE SSO with PKCE (public client, no
+  app secret) and stores tokens with owner-only permissions.
+- ESI has no "who fueled it" event, so BY comes from `[1]` claims and
+  refuel block counts are estimates (days added x the structure's service
+  burn rate). Fuel-bay contents (the F² column) are only visible through
+  Director-scoped corp assets; without that they show "?".

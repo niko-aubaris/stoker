@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12071c"/>
+      <stop offset="1" stop-color="#05060f"/>
+    </linearGradient>
+    <linearGradient id="fuel" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#00e5ff"/>
+      <stop offset="0.6" stop-color="#00e5ff"/>
+      <stop offset="1" stop-color="#ff2bd6"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="url(#bg)" stroke="#ff2bd6" stroke-width="2.5" stroke-opacity="0.55"/>
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="none" stroke="#00e5ff" stroke-width="1" stroke-opacity="0.35"/>
+
+  <!-- Upwell structure silhouette (Astrahus-like spindle) -->
+  <g filter="url(#glow)" transform="translate(128,116)">
+    <!-- central column -->
+    <polygon points="0,-74 22,-30 12,44 -12,44 -22,-30" fill="#0a1a22" stroke="#00e5ff" stroke-width="3"/>
+    <!-- upper spike -->
+    <polygon points="0,-74 8,-40 -8,-40" fill="#00e5ff"/>
+    <!-- side pods -->
+    <polygon points="22,-30 60,2 40,20 12,4" fill="#0a1a22" stroke="#ff2bd6" stroke-width="2.5"/>
+    <polygon points="-22,-30 -60,2 -40,20 -12,4" fill="#0a1a22" stroke="#ff2bd6" stroke-width="2.5"/>
+    <!-- core light -->
+    <circle cx="0" cy="-8" r="9" fill="#ff2bd6"/>
+    <circle cx="0" cy="-8" r="3.5" fill="#ffffff"/>
+  </g>
+
+  <!-- fuel gauge -->
+  <g transform="translate(58,196)">
+    <rect x="0" y="0" width="140" height="16" rx="8" fill="#0a1a22" stroke="#00e5ff" stroke-width="1.5" stroke-opacity="0.5"/>
+    <rect x="3" y="3" width="92" height="10" rx="5" fill="url(#fuel)"/>
+  </g>
+  <text x="128" y="240" text-anchor="middle" font-family="monospace" font-size="20" font-weight="700" fill="#00e5ff" letter-spacing="3">STOKER</text>
+</svg>
