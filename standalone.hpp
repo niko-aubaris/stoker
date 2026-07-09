@@ -21,6 +21,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <winhttp.h>
 #include <shellapi.h>
 typedef SOCKET sock_t;
 #define CLOSESOCK closesocket
@@ -36,6 +37,106 @@ typedef int sock_t;
 #endif
 
 namespace standalone {
+
+#ifdef _WIN32
+// --- native transport: WinHTTP ------------------------------------------------
+// The OS HTTP stack: honors the system proxy automatically, negotiates TLS
+// like the rest of Windows, and does not depend on whichever curl.exe is in
+// the PATH. Primary on Windows; the curl helpers below stay as fallback.
+static std::wstring _w(const std::string& s) {
+    std::wstring w;
+    w.reserve(s.size());
+    for (unsigned char c : s) w += (wchar_t)c;  // our URLs/headers are ASCII
+    return w;
+}
+static std::string _n(const wchar_t* s) {
+    std::string o;
+    for (; *s; s++) o += (char)(*s < 128 ? *s : '?');
+    return o;
+}
+
+// Returns the HTTP status (>0), or 0 on transport failure. Fills `out` with
+// the body; headers_out gets the x-pages/last-modified/expires trio when asked.
+static int winhttp_req(const std::string& url, const wchar_t* method,
+                       const std::string& bearer, const std::string& body,
+                       const wchar_t* ctype, std::string& out, json* headers_out) {
+    out.clear();
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof uc;
+    wchar_t host[256] = {0}, path[2048] = {0};
+    uc.lpszHostName = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = 2047;
+    std::wstring wurl = _w(url);
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return 0;
+#ifdef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+    HINTERNET ses = WinHttpOpen(L"STOKER", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses)  // pre-8.1 fallback
+        ses = WinHttpOpen(L"STOKER", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+#else
+    HINTERNET ses = WinHttpOpen(L"STOKER", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+#endif
+    if (!ses) return 0;
+#ifdef WINHTTP_OPTION_DECOMPRESSION
+    DWORD dec = WINHTTP_DECOMPRESSION_FLAG_ALL;
+    WinHttpSetOption(ses, WINHTTP_OPTION_DECOMPRESSION, &dec, sizeof dec);
+#endif
+    DWORD tmo = 30000;
+    WinHttpSetTimeouts(ses, tmo, tmo, tmo, tmo);
+    int status = 0;
+    HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
+    HINTERNET req = nullptr;
+    if (con)
+        req = WinHttpOpenRequest(con, method, path, nullptr, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (req) {
+        std::wstring hdrs;
+        if (!bearer.empty()) hdrs += L"Authorization: Bearer " + _w(bearer) + L"\r\n";
+        if (ctype && *ctype) hdrs += std::wstring(L"Content-Type: ") + ctype + L"\r\n";
+        BOOL ok = WinHttpSendRequest(
+            req, hdrs.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdrs.c_str(),
+            hdrs.empty() ? 0 : (DWORD)hdrs.size(),
+            body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(),
+            (DWORD)body.size(), (DWORD)body.size(), 0);
+        if (ok && WinHttpReceiveResponse(req, nullptr)) {
+            DWORD st = 0, sz = sizeof st;
+            WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz,
+                                WINHTTP_NO_HEADER_INDEX);
+            status = (int)st;
+            if (headers_out) {
+                auto qh = [&](const wchar_t* name) -> std::string {
+                    wchar_t buf[256];
+                    DWORD n = sizeof buf;
+                    std::wstring nm = name;
+                    if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CUSTOM, nm.c_str(), buf, &n,
+                                            WINHTTP_NO_HEADER_INDEX))
+                        return _n(buf);
+                    return "";
+                };
+                (*headers_out)["x-pages"] = qh(L"x-pages");
+                (*headers_out)["last-modified"] = qh(L"last-modified");
+                (*headers_out)["expires"] = qh(L"expires");
+            }
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(req, &avail) || !avail) break;
+                std::string chunk(avail, 0);
+                DWORD got = 0;
+                if (!WinHttpReadData(req, chunk.data(), avail, &got) || !got) break;
+                out.append(chunk.data(), got);
+            }
+        }
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+    return status;
+}
+#endif  // _WIN32
 
 static const int CALLBACK_PORT = 8420;
 static const char* SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token";
@@ -299,6 +400,12 @@ static std::string curl_error(const std::string& args) {
 }
 
 static std::string http_post_form(const std::string& url, const std::string& body) {
+#ifdef _WIN32
+    std::string out;
+    if (winhttp_req(url, L"POST", "", body, L"application/x-www-form-urlencoded",
+                    out, nullptr) > 0)
+        return out;
+#endif
     return run_curl("--max-time 20 -X POST "
                     "-H \"Content-Type: application/x-www-form-urlencoded\" "
                     "-d \"" + body + "\" \"" + url + "\"");
@@ -308,6 +415,13 @@ static std::string http_post_json(const std::string& url, const std::string& bod
     // body goes through a temp file: JSON is full of double quotes, which a
     // double-quoted shell argument cannot carry (and @file keeps the payload
     // off the process command line)
+#ifdef _WIN32
+    {
+        std::string out;
+        if (winhttp_req(url, L"POST", "", body, L"application/json", out, nullptr) > 0)
+            return out;
+    }
+#endif
     auto tmp = config_dir() / ("post-" + random_token(6) + ".json");
     { std::ofstream f(tmp); f << body; }
     std::string out = run_curl("--compressed --max-time 20 -X POST "
@@ -321,6 +435,13 @@ static std::string http_post_json(const std::string& url, const std::string& bod
 // GET with response headers; returns body, fills status + wanted headers.
 static std::string http_get(const std::string& url, const std::string& bearer,
                             int& status, json* headers_out = nullptr) {
+#ifdef _WIN32
+    {
+        std::string out;
+        int st = winhttp_req(url, L"GET", bearer, "", nullptr, out, headers_out);
+        if (st > 0) { status = st; return out; }  // 403/404 are real answers too
+    }
+#endif
     std::string args = "-i --compressed --max-time 30 ";
     if (!bearer.empty()) args += "-H \"Authorization: Bearer " + bearer + "\" ";
     args += "\"" + url + "\"";

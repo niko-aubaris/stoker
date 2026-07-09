@@ -320,7 +320,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.1.3";
+static const char* STOKER_VERSION = "v1.2.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -807,6 +807,29 @@ int main(int argc, char** argv) {
     g_defer_login = true;                      // SSO runs inside the window
     g_gui_wake = [] { glfwPostEmptyEvent(); };  // benign before glfwInit
 #endif
+    if (argc > 1 && std::string(argv[1]) == "--nettest") {
+        std::printf("STOKER %s network self-test\n\n", STOKER_VERSION);
+        auto probe = [](const char* label, const std::string& url) {
+            int st = 0;
+            standalone::http_get(url, "", st);
+            std::printf("  %-36s %s (HTTP %d)\n", label, st > 0 ? "OK" : "FAIL", st);
+            if (st <= 0)
+                std::printf("      -> %s\n", standalone::curl_error("\"" + url + "\"").c_str());
+        };
+        probe("EVE login (login.eveonline.com)",
+              "https://login.eveonline.com/.well-known/oauth-authorization-server");
+        probe("EVE ESI (esi.evetech.net)",
+              std::string(standalone::ESI) + "/status/?datasource=tranquility");
+        probe("updates (api.github.com)",
+              "https://api.github.com/repos/" + std::string(UPDATE_REPO) + "/releases/latest");
+        if (!standalone::g_history_api.empty())
+            probe("refuel history service", standalone::g_history_api + "/refuels?corp_id=1");
+        std::printf("\nOK means the connection works (any HTTP status is a real reply).\n"
+                    "[press Enter to close]");
+        std::string pause;
+        std::getline(std::cin, pause);
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("STOKER %s\n", STOKER_VERSION);
         return 0;

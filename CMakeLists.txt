@@ -19,8 +19,8 @@ FetchContent_MakeAvailable(ftxui)
 add_executable(stoker bpos-dash.cpp)
 target_link_libraries(stoker PRIVATE ftxui::component ftxui::dom ftxui::screen)
 if(MINGW)
-  # ws2_32: SSO loopback callback listener; shell32: ShellExecute (browser open)
-  target_link_libraries(stoker PRIVATE ws2_32 shell32)
+  # ws2_32: SSO loopback listener; shell32: browser open; winhttp: native transport
+  target_link_libraries(stoker PRIVATE ws2_32 shell32 winhttp)
 endif()
 
 # STOKER_STATIC=ON makes a self-contained binary (default for the Windows
@@ -71,7 +71,7 @@ if(STOKER_GUI)
   target_link_libraries(stoker-gui PRIVATE ftxui::component ftxui::dom ftxui::screen ${STOKER_GLFW})
   if(MINGW)
     # -mwindows: real windowed app, no console box behind it
-    target_link_libraries(stoker-gui PRIVATE opengl32 gdi32 ws2_32 shell32)
+    target_link_libraries(stoker-gui PRIVATE opengl32 gdi32 ws2_32 shell32 winhttp)
     target_link_options(stoker-gui PRIVATE -static -mwindows)
   else()
     find_package(OpenGL REQUIRED)
