@@ -49,7 +49,9 @@ The report contains exactly what your own ESI view returned: structure
 ids, names, systems, and fuel expiry times, nothing else, no tokens.
 Privacy switch: set `"history_api": ""` in config.json to disable, or
 point it at your own server (two endpoints: `POST /report`,
-`GET /refuels?corp_id=`; see the STOKER backend source).
+`GET /refuels?corp_id=`; see the STOKER backend source). The shared
+service is rate-limited per IP - far above the app's normal polling,
+but don't hammer it.
 
 **Updates:** on startup STOKER checks the newest GitHub release once; if
 a newer version exists the header offers it and `u` downloads and swaps
