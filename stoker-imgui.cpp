@@ -12,6 +12,7 @@
 
 #include "font_dejavu_mono.hpp"
 #include "icons_data.hpp"
+#include "window_icon_data.hpp"
 
 // --- theme -------------------------------------------------------------------
 static const ImVec4 PINK(1.00f, 0.17f, 0.84f, 1), CYAN_(0.00f, 0.90f, 1.00f, 1),
@@ -199,6 +200,12 @@ int main(int argc, char** argv) {
     if (!glfwInit()) return 1;
     GLFWwindow* win = glfwCreateWindow(1280, 820, "STOKER", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
+    {
+        GLFWimage ims[3] = {{64, 64, (unsigned char*)kWinIcon64},
+                            {32, 32, (unsigned char*)kWinIcon32},
+                            {16, 16, (unsigned char*)kWinIcon16}};
+        glfwSetWindowIcon(win, 3, ims);
+    }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
     g_gui_wake = [] { glfwPostEmptyEvent(); };
