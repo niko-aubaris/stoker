@@ -170,7 +170,7 @@ static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac, in
         dl->AddRectFilled(p, ImVec2(fillx, p.y + h), col, 2.0f);
     }
     ImFont* fnt = ImGui::GetFont();
-    float fs = h - 1.5f;
+    float fs = std::min(h - 3.0f, 16.0f);
     auto put = [&](const std::string& s, bool rightside) {
         if (s.empty()) return;
         ImVec2 ts = fnt->CalcTextSizeA(fs, FLT_MAX, 0, s.c_str());
@@ -192,26 +192,28 @@ static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac, in
 static void dual_gauge(const Row& r, float w) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    float total = ImGui::GetTextLineHeight() + 6;
+    float total = (ImGui::GetTextLineHeight() + 6) * 2;  // doubled meters
     float h = (total - 2) / 2;
+    bool has2 = !r.fuel2_name.empty();
+    float h1 = has2 ? h : total;  // no secondary fuel: the fuel bar gets it all
     char b[32];
     std::snprintf(b, sizeof b, "%.1fd", r.days);
     if (!r.has_fuel)
-        mini_bar(dl, p, w, h, -1, -1, "--", "", false);
+        mini_bar(dl, p, w, h1, -1, -1, "--", "", false);
     else
-        mini_bar(dl, p, w, h, r.days / GAUGE_DAYS, urgency_band(r.days), b, units_raw(r), false);
-    ImVec2 p2(p.x, p.y + h + 2);
-    if (r.fuel2_name.empty())
-        mini_bar(dl, p2, w, h, -1, -1, "-", "", true);
-    else if (r.fuel2 < 0)
-        mini_bar(dl, p2, w, h, -1, -1, "?", "", true);
-    else if (r.gas_day > 0) {
-        char g[32];
-        std::snprintf(g, sizeof g, "%.1fd", fuel2_days(r));
-        mini_bar(dl, p2, w, h, fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), g, gas30_raw(r), true);
-    } else {
-        mini_bar(dl, p2, w, h, r.lo_target > 0 ? r.fuel2 / r.lo_target : -1, fuel2_band(r),
-                 compact_units(r.fuel2), gas30_raw(r), true);
+        mini_bar(dl, p, w, h1, r.days / GAUGE_DAYS, urgency_band(r.days), b, units_raw(r), false);
+    if (has2) {
+        ImVec2 p2(p.x, p.y + h + 2);
+        if (r.fuel2 < 0)
+            mini_bar(dl, p2, w, h, -1, -1, "?", "", true);
+        else if (r.gas_day > 0) {
+            char g[32];
+            std::snprintf(g, sizeof g, "%.1fd", fuel2_days(r));
+            mini_bar(dl, p2, w, h, fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), g, gas30_raw(r), true);
+        } else {
+            mini_bar(dl, p2, w, h, r.lo_target > 0 ? r.fuel2 / r.lo_target : -1, fuel2_band(r),
+                     compact_units(r.fuel2), gas30_raw(r), true);
+        }
     }
     ImGui::Dummy(ImVec2(w, total));
 }
