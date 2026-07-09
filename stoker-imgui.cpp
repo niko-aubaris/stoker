@@ -158,6 +158,64 @@ static ImTextureID make_icon(const unsigned char* rgba) {
 }
 static ImTextureID g_ic_fuel, g_ic_gas, g_ic_ozone;
 
+// one half-height meter strip (small text riding inside)
+static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac, int band,
+                     const std::string& left, const std::string& right, bool secondary) {
+    ImU32 col = band_u32(band, secondary);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 2.0f);
+    float fillx = p.x;
+    if (frac >= 0) {
+        float f = frac > 1 ? 1.f : (float)frac;
+        fillx = p.x + w * f;
+        dl->AddRectFilled(p, ImVec2(fillx, p.y + h), col, 2.0f);
+    }
+    ImFont* fnt = ImGui::GetFont();
+    float fs = h - 1.5f;
+    auto put = [&](const std::string& s, bool rightside) {
+        if (s.empty()) return;
+        ImVec2 ts = fnt->CalcTextSizeA(fs, FLT_MAX, 0, s.c_str());
+        float x = rightside ? p.x + w - ts.x - 4 : p.x + 4;
+        ImU32 tc = (x + ts.x * 0.5f) < fillx ? IM_COL32(12, 12, 18, 255) : col;
+        dl->AddText(fnt, fs, ImVec2(x, p.y + (h - ts.y) * 0.5f), tc, s.c_str());
+    };
+    if (frac < 0) {
+        ImVec2 ts = fnt->CalcTextSizeA(fs, FLT_MAX, 0, left.c_str());
+        dl->AddText(fnt, fs, ImVec2(p.x + (w - ts.x) / 2, p.y + (h - ts.y) * 0.5f), col,
+                    left.c_str());
+    } else {
+        put(left, false);
+        put(right, true);
+    }
+}
+
+// both meters stacked in one row-height cell: fuel blocks on top, gas/oz below
+static void dual_gauge(const Row& r, float w) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float total = ImGui::GetTextLineHeight() + 6;
+    float h = (total - 2) / 2;
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1fd", r.days);
+    if (!r.has_fuel)
+        mini_bar(dl, p, w, h, -1, -1, "--", "", false);
+    else
+        mini_bar(dl, p, w, h, r.days / GAUGE_DAYS, urgency_band(r.days), b, units_raw(r), false);
+    ImVec2 p2(p.x, p.y + h + 2);
+    if (r.fuel2_name.empty())
+        mini_bar(dl, p2, w, h, -1, -1, "-", "", true);
+    else if (r.fuel2 < 0)
+        mini_bar(dl, p2, w, h, -1, -1, "?", "", true);
+    else if (r.gas_day > 0) {
+        char g[32];
+        std::snprintf(g, sizeof g, "%.1fd", fuel2_days(r));
+        mini_bar(dl, p2, w, h, fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), g, gas30_raw(r), true);
+    } else {
+        mini_bar(dl, p2, w, h, r.lo_target > 0 ? r.fuel2 / r.lo_target : -1, fuel2_band(r),
+                 compact_units(r.fuel2), gas30_raw(r), true);
+    }
+    ImGui::Dummy(ImVec2(w, total));
+}
+
 // --- the gauge widget: fill fraction + text inside -----------------------------
 static void gauge(const char* id, double frac, int band, const std::string& left,
                   const std::string& right, float w, bool secondary = false) {
@@ -603,12 +661,11 @@ int main(int argc, char** argv) {
         // split: table left, detail/log right
         float leftw = ImGui::GetContentRegionAvail().x * 0.62f;
         ImGui::BeginChild("left", ImVec2(leftw, 0), true);
-        if (ImGui::BeginTable("structs", 5,
+        if (ImGui::BeginTable("structs", 4,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("Blocks / 30d", ImGuiTableColumnFlags_WidthFixed, 170);
-            ImGui::TableSetupColumn("Gas-Oz / 30d", ImGuiTableColumnFlags_WidthFixed, 170);
+            ImGui::TableSetupColumn("Blocks | Gas-Oz (to 30d)", ImGuiTableColumnFlags_WidthFixed, 190);
             ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 110);
             ImGui::TableSetupColumn("System", ImGuiTableColumnFlags_WidthFixed, 70);
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
@@ -622,20 +679,19 @@ int main(int argc, char** argv) {
                                      [&](const Row* a, const Row* b) {
                         auto key = [&](const Row* r) -> std::string {
                             switch (ci) {
-                                case 2: return r->type;
-                                case 3: return r->system;
+                                case 1: return r->type;
+                                case 2: return r->system;
                                 default: return r->name;
                             }
                         };
-                        if (ci == 0) {
-                            double da = a->has_fuel ? a->days : 1e9,
-                                   db = b->has_fuel ? b->days : 1e9;
-                            return asc ? da < db : da > db;
-                        }
-                        if (ci == 1) {
-                            double da = fuel2_days(*a), db = fuel2_days(*b);
-                            if (da < 0) da = 1e9;
-                            if (db < 0) db = 1e9;
+                        if (ci == 0) {  // worst of either clock
+                            auto worst = [](const Row* r) {
+                                double d = r->has_fuel ? r->days : 1e9;
+                                double g = fuel2_days(*r);
+                                if (g >= 0) d = std::min(d, g);
+                                return d;
+                            };
+                            double da = worst(a), db = worst(b);
                             return asc ? da < db : da > db;
                         }
                         return asc ? key(a) < key(b) : key(a) > key(b);
@@ -647,31 +703,12 @@ int main(int argc, char** argv) {
                 const Row& r = *rp;
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                char db[32];
-                std::snprintf(db, sizeof db, "%.1fd", r.days);
-                if (!r.has_fuel)
-                    gauge("f", -1, -1, "--", "", 160);
-                else
-                    gauge("f", r.days / GAUGE_DAYS, urgency_band(r.days), db,
-                          units_raw(r), 160);
+                dual_gauge(r, 180);
                 ImGui::TableSetColumnIndex(1);
-                if (r.fuel2_name.empty())
-                    gauge("g", -1, -1, "-", "", 160, true);
-                else if (r.fuel2 < 0)
-                    gauge("g", -1, -1, "?", "", 160, true);
-                else if (r.gas_day > 0) {
-                    char gb[32];
-                    std::snprintf(gb, sizeof gb, "%.1fd", fuel2_days(r));
-                    gauge("g", fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), gb, gas30_raw(r), 160, true);
-                } else {
-                    gauge("g", r.lo_target > 0 ? r.fuel2 / r.lo_target : -1, fuel2_band(r),
-                          compact_units(r.fuel2), gas30_raw(r), 160, true);
-                }
-                ImGui::TableSetColumnIndex(2);
                 ImGui::TextUnformatted(r.type.c_str());
-                ImGui::TableSetColumnIndex(3);
+                ImGui::TableSetColumnIndex(2);
                 ImGui::TextColored(CYAN_, "%s", r.system.c_str());
-                ImGui::TableSetColumnIndex(4);
+                ImGui::TableSetColumnIndex(3);
                 if (ImGui::Selectable((r.name + "##" + std::to_string(r.sid)).c_str(),
                                       r.sid == detail_sid,
                                       ImGuiSelectableFlags_SpanAllColumns)) {

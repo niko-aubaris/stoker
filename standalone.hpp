@@ -430,15 +430,18 @@ static std::string http_get(const std::string& url, const std::string& bearer,
 static std::string http_post_auth(const std::string& url, const std::string& bearer,
                                   int& status) {
     status = 0;
+    std::string raw = run_curl("-i --max-time 20 -X POST -H \"Authorization: Bearer " +
+                               bearer + "\" \"" + url + "\"");
+    if (!raw.empty()) {
+        size_t sp = raw.find(' ');
+        if (sp != std::string::npos) status = std::atoi(raw.c_str() + sp);
+        return raw;
+    }
 #ifdef _WIN32
     std::string out;
     int st = winhttp_req(url, L"POST", bearer, "", nullptr, out, nullptr);
     if (st > 0) { status = st; return out; }
 #endif
-    std::string raw = run_curl("-i --max-time 20 -X POST -H \"Authorization: Bearer " +
-                               bearer + "\" \"" + url + "\"");
-    size_t sp = raw.find(' ');
-    if (sp != std::string::npos) status = std::atoi(raw.c_str() + sp);
     return raw;
 }
 
@@ -448,28 +451,20 @@ static std::string http_get_body(const std::string& url) {
 }
 
 static std::string http_post_form(const std::string& url, const std::string& body) {
+    std::string out = run_curl("--max-time 20 -X POST "
+                               "-H \"Content-Type: application/x-www-form-urlencoded\" "
+                               "-d \"" + body + "\" \"" + url + "\"");
 #ifdef _WIN32
-    std::string out;
-    if (winhttp_req(url, L"POST", "", body, L"application/x-www-form-urlencoded",
-                    out, nullptr) > 0)
-        return out;
+    if (out.empty())
+        winhttp_req(url, L"POST", "", body, L"application/x-www-form-urlencoded", out, nullptr);
 #endif
-    return run_curl("--max-time 20 -X POST "
-                    "-H \"Content-Type: application/x-www-form-urlencoded\" "
-                    "-d \"" + body + "\" \"" + url + "\"");
+    return out;
 }
 
 static std::string http_post_json(const std::string& url, const std::string& body) {
     // body goes through a temp file: JSON is full of double quotes, which a
     // double-quoted shell argument cannot carry (and @file keeps the payload
     // off the process command line)
-#ifdef _WIN32
-    {
-        std::string out;
-        if (winhttp_req(url, L"POST", "", body, L"application/json", out, nullptr) > 0)
-            return out;
-    }
-#endif
     auto tmp = config_dir() / ("post-" + random_token(6) + ".json");
     { std::ofstream f(tmp); f << body; }
     std::string out = run_curl("--compressed --max-time 20 -X POST "
@@ -477,23 +472,27 @@ static std::string http_post_json(const std::string& url, const std::string& bod
                                 "--data @\"" + tmp.string() + "\" \"" + url + "\"");
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
+#ifdef _WIN32
+    if (out.empty())
+        winhttp_req(url, L"POST", "", body, L"application/json", out, nullptr);
+#endif
     return out;
 }
 
 // GET with response headers; returns body, fills status + wanted headers.
 static std::string http_get(const std::string& url, const std::string& bearer,
                             int& status, json* headers_out = nullptr) {
+    std::string args = "-i --compressed --max-time 30 ";
+    if (!bearer.empty()) args += "-H \"Authorization: Bearer " + bearer + "\" ";
+    args += "\"" + url + "\"";
+    std::string raw = run_curl(args);
 #ifdef _WIN32
-    {
+    if (raw.empty()) {
         std::string out;
         int st = winhttp_req(url, L"GET", bearer, "", nullptr, out, headers_out);
         if (st > 0) { status = st; return out; }  // 403/404 are real answers too
     }
 #endif
-    std::string args = "-i --compressed --max-time 30 ";
-    if (!bearer.empty()) args += "-H \"Authorization: Bearer " + bearer + "\" ";
-    args += "\"" + url + "\"";
-    std::string raw = run_curl(args);
     status = 0;
     const char* seps[] = {"\r\n\r\n", "\n\n"};  // some pipes eat the \r
     size_t sep = std::string::npos;
@@ -539,17 +538,6 @@ static bool download_file(const std::string& url, const std::filesystem::path& p
         return std::filesystem::exists(path, ec) &&
                std::filesystem::file_size(path, ec) >= min_size;
     };
-#ifdef _WIN32
-    {
-        std::string blob;
-        if (winhttp_req(url, L"GET", "", "", nullptr, blob, nullptr) == 200 &&
-            blob.size() >= min_size) {
-            std::ofstream f(path, std::ios::binary);
-            f.write(blob.data(), (std::streamsize)blob.size());
-        }
-        if (landed()) return true;
-    }
-#endif
     auto try_curl = [&](const std::string& flags) {
         std::filesystem::remove(path, ec);
         run_cmd(("curl -sL " + (flags.empty() ? std::string() : flags + " ") +
@@ -569,6 +557,15 @@ static bool download_file(const std::string& url, const std::filesystem::path& p
             g_curl_extra = f;
             return true;
         }
+    }
+    {   // last resort: the OS HTTP stack
+        std::string blob;
+        if (winhttp_req(url, L"GET", "", "", nullptr, blob, nullptr) == 200 &&
+            blob.size() >= min_size) {
+            std::ofstream f(path, std::ios::binary);
+            f.write(blob.data(), (std::streamsize)blob.size());
+        }
+        if (landed()) return true;
     }
 #endif
     return false;
