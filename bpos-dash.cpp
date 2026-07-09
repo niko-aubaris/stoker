@@ -226,12 +226,14 @@ static int urgency_band(double days) {
     return 3;
 }
 
-static Color band_color(int band) {
+// Danger colors are universal; the HEALTHY hue tells the columns apart:
+// fuel blocks glow cyan-teal (like the blocks), gas/ozone glows violet.
+static Color band_color(int band, bool secondary = false) {
     switch (band) {
         case 0: return Color::RGB(255, 70, 70);
         case 1: return Color::RGB(255, 140, 0);
         case 2: return Color::RGB(250, 215, 70);
-        case 3: return Color::RGB(90, 225, 130);
+        case 3: return secondary ? Color::RGB(172, 128, 255) : Color::RGB(56, 216, 232);
         default: return Color::RGB(128, 136, 150);
     }
 }
@@ -278,7 +280,7 @@ static std::string units_raw(const Row& r) {
 
 
 
-static Color fuel2_color(const Row& r) { return band_color(fuel2_band(r)); }
+static Color fuel2_color(const Row& r) { return band_color(fuel2_band(r), true); }
 
 static Color need_color(const Row& r) {
     if (r.need < 0) return Color::RGB(128, 136, 150);
@@ -429,7 +431,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.0.2";
+static const char* STOKER_VERSION = "v2.0.3";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)

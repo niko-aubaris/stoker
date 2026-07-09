@@ -19,12 +19,12 @@ static const ImVec4 PINK(1.00f, 0.17f, 0.84f, 1), CYAN_(0.00f, 0.90f, 1.00f, 1),
     DIMCYAN(0.00f, 0.51f, 0.59f, 1), GREY_(0.50f, 0.53f, 0.59f, 1),
     TEXTC(0.90f, 0.92f, 0.96f, 1);
 
-static ImU32 band_u32(int band) {
+static ImU32 band_u32(int band, bool secondary = false) {
     switch (band) {
         case 0: return IM_COL32(255, 70, 70, 255);
         case 1: return IM_COL32(255, 140, 0, 255);
         case 2: return IM_COL32(250, 215, 70, 255);
-        case 3: return IM_COL32(90, 225, 130, 255);
+        case 3: return secondary ? IM_COL32(172, 128, 255, 255) : IM_COL32(56, 216, 232, 255);
         default: return IM_COL32(128, 136, 150, 255);
     }
 }
@@ -44,11 +44,11 @@ static ImTextureID g_ic_fuel, g_ic_gas, g_ic_ozone;
 
 // --- the gauge widget: fill fraction + text inside -----------------------------
 static void gauge(const char* id, double frac, int band, const std::string& left,
-                  const std::string& right, float w) {
+                  const std::string& right, float w, bool secondary = false) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
     float h = ImGui::GetTextLineHeight() + 4;
-    ImU32 col = band_u32(band);
+    ImU32 col = band_u32(band, secondary);
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 3.0f);
     if (frac >= 0) {
         float f = frac > 1 ? 1.f : (float)frac;
@@ -411,16 +411,16 @@ int main(int argc, char** argv) {
                           units_raw(r), 160);
                 ImGui::TableSetColumnIndex(1);
                 if (r.fuel2_name.empty())
-                    gauge("g", -1, -1, "-", "", 160);
+                    gauge("g", -1, -1, "-", "", 160, true);
                 else if (r.fuel2 < 0)
-                    gauge("g", -1, -1, "?", "", 160);
+                    gauge("g", -1, -1, "?", "", 160, true);
                 else if (r.gas_day > 0) {
                     char gb[32];
                     std::snprintf(gb, sizeof gb, "%.1fd", fuel2_days(r));
-                    gauge("g", fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), gb, gas30_raw(r), 160);
+                    gauge("g", fuel2_days(r) / GAUGE_DAYS, fuel2_band(r), gb, gas30_raw(r), 160, true);
                 } else {
                     gauge("g", r.lo_target > 0 ? r.fuel2 / r.lo_target : -1, fuel2_band(r),
-                          compact_units(r.fuel2), gas30_raw(r), 160);
+                          compact_units(r.fuel2), gas30_raw(r), 160, true);
                 }
                 ImGui::TableSetColumnIndex(2);
                 ImGui::TextUnformatted(r.type.c_str());
