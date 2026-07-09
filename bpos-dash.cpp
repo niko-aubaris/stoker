@@ -86,6 +86,11 @@ struct RefuelEvent {
     double days_added = 0;
 };
 
+struct GooItem {
+    std::string name;
+    double qty = 0, m3 = 0, isk = 0;
+};
+
 struct Row {
     long long sid = 0;
     std::string name, system, type, state, services, fuel_expires, last_refuel;
@@ -100,8 +105,23 @@ struct Row {
     double gas_day = -1, gas_month = -1, gas_m3 = -1;  // Metenox magmatic
     std::string fuel2_name;           // secondary fuel kind (gas/ozone), "" = none
     double fuel2 = -1;                // stock units; -1 = source can't see the bay
+    std::string rental, renter;       // moon-rental class: corp|private|unknown, "" = n/a
+    double goo_m3 = -1, goo_cap = -1, goo_isk = -1;  // Metenox moon material bay
+    std::vector<GooItem> goo;         // bay contents by value, priced at market avg
+    std::string state_timer_start, state_timer_end;  // reinforcement clock (ISO)
+    std::string extraction_start, chunk_arrival;     // Athanor/Tatara moon pull (ISO)
     std::vector<RefuelEvent> log;     // this structure's last refuel events
 };
+
+// ISK shorthand for inside the gauges: 1.24b / 830.5m / 12k
+static std::string isk_compact(double v) {
+    char b[32];
+    if (v >= 1e9) std::snprintf(b, sizeof b, "%.2fb", v / 1e9);
+    else if (v >= 1e6) std::snprintf(b, sizeof b, "%.1fm", v / 1e6);
+    else if (v >= 1e3) std::snprintf(b, sizeof b, "%.0fk", v / 1e3);
+    else std::snprintf(b, sizeof b, "%.0f", v);
+    return b;
+}
 
 // Types that carry a secondary fuel besides blocks: Metenox drink magmatic
 // gas, gates and cyno beacons burn liquid ozone per jump.
@@ -144,9 +164,17 @@ static int g_tab = 0;
 // config "tab_type_filter": {"SOUSN": "Metenox Moon Drill", ...}; a corp tab
 // starts with that type filter active instead of All
 static std::map<std::string, std::string> g_tab_default_filter;
+
+// EVE client chat-log awareness (GUI map overlay): config "eve_logs" points
+// at the client's logs dir (auto-detected when empty), "intel_channels" lists
+// channel names to tail (empty = any channel with "intel" in the name).
+static std::string g_eve_logs_cfg;
+static std::vector<std::string> g_intel_channels_cfg;
 static std::string g_pulled_at;
 static std::string g_corp_name;  // whose structures the active feed shows
 static std::string g_fuel2_status;  // ok|relogin|director|error|off - why F² has data or not
+static bool g_rentals_online = false;  // moon-rental classification feed reachable this pull
+static bool g_extractions_ok = false;  // corp mining extractions readable this pull
 static std::string g_esi_lastmod, g_esi_expires;  // CCP regenerates hourly
 static std::string g_status = "connecting to the box...";
 static std::string g_note;         // last claim result, shown for a few seconds
@@ -431,7 +459,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.2.1";
+static const char* STOKER_VERSION = "v2.3.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -663,6 +691,10 @@ static void ingest(const std::string& raw) {
         r.system = s.value("system", "");
         r.type = s.value("type", "");
         r.state = s.value("state", "");
+        r.state_timer_start = s.value("state_timer_start", "");
+        r.state_timer_end = s.value("state_timer_end", "");
+        r.extraction_start = s.value("extraction_start", "");
+        r.chunk_arrival = s.value("chunk_arrival", "");
         r.services = s.value("services", "");
         r.fuel_expires = s.value("fuel_expires", "");
         if (s.contains("fuel_days_left") && !s["fuel_days_left"].is_null()) {
@@ -678,6 +710,23 @@ static void ingest(const std::string& raw) {
         r.type = display_type(r.type);
         if (s.contains("fuel2_units") && !s["fuel2_units"].is_null())
             r.fuel2 = s["fuel2_units"].get<double>();
+        r.rental = s.value("rental", "");
+        r.renter = s.value("renter", "");
+        auto numg = [&s](const char* k) -> double {
+            return (s.contains(k) && !s[k].is_null()) ? s[k].get<double>() : -1.0;
+        };
+        r.goo_m3 = numg("goo_m3");
+        r.goo_cap = numg("goo_capacity");
+        r.goo_isk = numg("goo_isk");
+        if (s.contains("goo") && s["goo"].is_array())
+            for (auto& g : s["goo"]) {
+                GooItem gi;
+                gi.name = g.value("name", "");
+                gi.qty = g.value("qty", 0.0);
+                gi.m3 = g.value("m3", 0.0);
+                gi.isk = g.value("isk", 0.0);
+                r.goo.push_back(std::move(gi));
+            }
         auto numf = [&s](const char* k) -> double {
             return (s.contains(k) && !s[k].is_null()) ? s[k].get<double>() : -1.0;
         };
@@ -747,6 +796,8 @@ static void ingest(const std::string& raw) {
     g_pulled_at = d.value("pulled_at", "");
     g_corp_name = d.value("corp", "");
     g_fuel2_status = d.value("fuel2_status", "");
+    g_rentals_online = d.value("rentals_online", false);
+    g_extractions_ok = d.value("extractions_ok", false);
     g_esi_lastmod = d.contains("esi_last_modified") && !d["esi_last_modified"].is_null()
                         ? d["esi_last_modified"].get<std::string>() : "";
     g_esi_expires = d.contains("esi_expires") && !d["esi_expires"].is_null()
@@ -831,6 +882,17 @@ static bool load_or_setup(bool force_corp) {
         standalone::g_scopes = cfg["scopes"].get<std::string>();
     if (cfg.contains("history_api") && cfg["history_api"].is_string())
         standalone::g_history_api = cfg["history_api"].get<std::string>();
+    if (cfg.contains("rentals_api") && cfg["rentals_api"].is_string())
+        standalone::g_rentals_api = cfg["rentals_api"].get<std::string>();
+    if (cfg.contains("rentals_token") && cfg["rentals_token"].is_string())
+        standalone::g_rentals_token = cfg["rentals_token"].get<std::string>();
+    if (cfg.contains("rentals_corp_id") && cfg["rentals_corp_id"].is_number())
+        standalone::g_rentals_corp = cfg["rentals_corp_id"].get<long long>();
+    if (cfg.contains("eve_logs") && cfg["eve_logs"].is_string())
+        g_eve_logs_cfg = cfg["eve_logs"].get<std::string>();
+    if (cfg.contains("intel_channels") && cfg["intel_channels"].is_array())
+        for (auto& v : cfg["intel_channels"])
+            if (v.is_string()) g_intel_channels_cfg.push_back(v.get<std::string>());
     if (cfg.contains("update_check") && cfg["update_check"].is_boolean())
         g_update_check = cfg["update_check"].get<bool>();
     if (cfg.contains("tab_type_filter") && cfg["tab_type_filter"].is_object())
@@ -1009,7 +1071,31 @@ int main(int argc, char** argv) {
                 try { d = json::parse(s.data); } catch (...) {}
                 std::string line = (s.label.empty() ? std::string("(no corp)") : s.label) + ": " +
                     std::to_string(d.value("structures", json::array()).size()) + " structures" +
-                    "  F2: " + d.value("fuel2_status", "?");
+                    "  F2: " + d.value("fuel2_status", "?") +
+                    "  moon-pull: " + (d.value("extractions_ok", false) ? "ok" : "off");
+                if (d.value("rentals_online", false)) {
+                    int rented = 0, corpm = 0;
+                    for (auto& st : d.value("structures", json::array())) {
+                        std::string ty = st.value("rental", "");
+                        if (ty == "private") rented++;
+                        else if (ty == "corp") corpm++;
+                    }
+                    line += "  rentals: " + std::to_string(rented) + " rented / " +
+                            std::to_string(corpm) + " corp";
+                }
+                {
+                    double gm3 = 0, gisk = 0;
+                    int drills = 0;
+                    for (auto& st : d.value("structures", json::array()))
+                        if (st.contains("goo_capacity")) {
+                            drills++;
+                            gm3 += st.value("goo_m3", 0.0);
+                            gisk += st.value("goo_isk", 0.0);
+                        }
+                    if (drills)
+                        line += "  goo: " + std::to_string(drills) + " drills, " +
+                                std::to_string((long long)gm3) + " m3, " + isk_compact(gisk);
+                }
                 if (d.contains("error")) line += "  error: " + d.value("error", "");
                 std::printf("%s\n", line.c_str());
             }

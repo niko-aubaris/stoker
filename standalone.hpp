@@ -144,18 +144,25 @@ static const int CALLBACK_PORT = 8420;
 static const char* SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token";
 static const char* ESI = "https://esi.evetech.net/latest";
 // Requested at login: structures (the dashboard) + corp assets (the F²
-// fuel-bay column; only readable in-game by Directors, others just 403 to
-// "?"). Overridable via config.json "scopes", e.g. to trim back to
-// structures-only.
+// fuel-bay column + moongoo; Director-gated in-game, others just 403 to "?")
+// + corp mining (Athanor moon-pull timers) + waypoint (set destination).
+// Overridable via config.json "scopes", e.g. to trim back to structures-only.
 static const char* SCOPE =
     "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
-    "esi-ui.write_waypoint.v1";
+    "esi-industry.read_corporation_mining.v1 esi-ui.write_waypoint.v1";
 static std::string g_scopes = SCOPE;
 // Refuel-history service: standalone clients have no storage, so each poll
 // reports its snapshot here and reads back the refuel log the server builds
 // by diffing snapshots over time. Keyless, scoped per corp; config
 // "history_api" overrides, empty string disables. See README (privacy note).
 static std::string g_history_api = "https://api.escalateanyways.com/market/stoker";
+
+// Moon-rental classification feed: which anchored moon structures are rented
+// out vs corp-kept. Only queried for the corp the feed describes. config
+// "rentals_api" (full endpoint URL) + "rentals_token" + "rentals_corp_id";
+// empty URL = off.
+static std::string g_rentals_api, g_rentals_token;
+static long long g_rentals_corp = 98695839;  // SOUSN
 
 // --- sha256 (for the PKCE code challenge) -----------------------------------
 struct Sha256 {
@@ -969,6 +976,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     // esi-assets.read_corporation_assets.v1 scope + an in-game Director role;
     // anything short of that 403s and the column shows "?".
     std::map<long long, double> gas_at, ozone_at;
+    std::map<long long, std::map<long long, double>> goo_at;  // structure -> type -> qty
     bool assets_ok = false;
     std::string fuel2_status = "off";  // ok | relogin | director | error | off
     if (!token_has_scope(tok, "esi-assets.read_corporation_assets.v1")) {
@@ -990,17 +998,80 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             if (!j.is_array()) break;
             assets_ok = true;
             for (auto& it : j) {
-                if (it.value("location_flag", "") != "StructureFuel") continue;
+                std::string flag = it.value("location_flag", "");
                 long long loc = it.value("location_id", 0LL);
                 long long tid = it.value("type_id", 0LL);
                 double q = it.value("quantity", 0.0);
-                if (tid == 81143) gas_at[loc] += q;        // Magmatic Gas
-                else if (tid == 16273) ozone_at[loc] += q;  // Liquid Ozone
+                if (flag == "StructureFuel") {
+                    if (tid == 81143) gas_at[loc] += q;        // Magmatic Gas
+                    else if (tid == 16273) ozone_at[loc] += q;  // Liquid Ozone
+                } else if (flag == "MoonMaterialBay") {
+                    goo_at[loc][tid] += q;  // mined moongoo output
+                }
             }
             if (page == 1 && ahdr.value("x-pages", std::string()) != "")
                 pages = std::atoi(ahdr["x-pages"].get<std::string>().c_str());
         }
         if (assets_ok) fuel2_status = "ok";
+    }
+
+    // Moongoo valuation: public market averages (hourly cache) plus type
+    // name/volume (session cache; the moon-material set is a few dozen types).
+    static std::mutex s_val_mtx;
+    static std::map<long long, double> s_price;
+    static time_t s_price_at = 0;
+    static std::map<long long, std::pair<std::string, double>> s_type;  // name, m3/unit
+    if (!goo_at.empty()) {
+        std::lock_guard<std::mutex> vl(s_val_mtx);
+        if (time(nullptr) - s_price_at > 3600) {
+            try {
+                json pj = json::parse(http_get_body(
+                    ESI + std::string("/markets/prices/?datasource=tranquility")));
+                for (auto& e : pj) {
+                    double ap = e.contains("average_price") && e["average_price"].is_number()
+                                    ? e["average_price"].get<double>()
+                                    : e.value("adjusted_price", 0.0);
+                    s_price[e.value("type_id", 0LL)] = ap;
+                }
+                s_price_at = time(nullptr);
+            } catch (...) { /* valuation is best-effort */ }
+        }
+        for (auto& lt : goo_at)
+            for (auto& tq : lt.second)
+                if (!s_type.count(tq.first)) try {
+                    json tj = json::parse(http_get_body(
+                        ESI + std::string("/universe/types/") + std::to_string(tq.first) +
+                        "/?datasource=tranquility"));
+                    s_type[tq.first] = {tj.value("name", "type " + std::to_string(tq.first)),
+                                        tj.value("volume", 0.0)};
+                } catch (...) {
+                    s_type[tq.first] = {"type " + std::to_string(tq.first), 0.0};
+                }
+    }
+
+    // Athanor/Tatara moon-pull schedule. Needs esi-industry.read_corporation_mining.v1
+    // on the token - config "scopes" opt-in until the shared dev app allows it
+    // (adding it to the default SCOPE before then would break new logins).
+    std::map<long long, std::pair<std::string, std::string>> extr;  // sid -> start, arrival
+    bool extr_ok = false;
+    if (token_has_scope(tok, "esi-industry.read_corporation_mining.v1")) {
+        int xst = 0;
+        std::string xbody = http_get(ESI + std::string("/corporation/") +
+                                         std::to_string(corp_id) +
+                                         "/mining/extractions/?datasource=tranquility",
+                                     tok, xst);
+        if (xst == 200) try {
+            json xj = json::parse(xbody);
+            if (xj.is_array()) {
+                extr_ok = true;
+                for (auto& e : xj) {
+                    long long esid = e.value("structure_id", 0LL);
+                    std::string arr = e.value("chunk_arrival_time", "");
+                    if (arr > extr[esid].second)  // newest schedule wins (ISO sorts)
+                        extr[esid] = {e.value("extraction_start_time", ""), arr};
+                }
+            }
+        } catch (...) {}
     }
 
     time_t now = time(nullptr);
@@ -1016,6 +1087,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     json out;
     out["corp"] = corp_display;  // the header brands itself with this
     out["fuel2_status"] = fuel2_status;
+    out["extractions_ok"] = extr_ok;
     out["pulled_at"] = now_iso;
     std::string lm = http_date_to_iso(hdr.value("last-modified", std::string()));
     std::string ex = http_date_to_iso(hdr.value("expires", std::string()));
@@ -1031,6 +1103,17 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         r["type"] = names.count(s.value("type_id", 0LL))
                         ? names[s.value("type_id", 0LL)] : "";
         r["state"] = s.value("state", "");
+        if (s.contains("state_timer_start") && s["state_timer_start"].is_string())
+            r["state_timer_start"] = s["state_timer_start"];
+        if (s.contains("state_timer_end") && s["state_timer_end"].is_string())
+            r["state_timer_end"] = s["state_timer_end"];
+        if (extr_ok) {
+            auto eit = extr.find(s.value("structure_id", 0LL));
+            if (eit != extr.end()) {
+                r["extraction_start"] = eit->second.first;
+                r["chunk_arrival"] = eit->second.second;
+            }
+        }
         std::string svc;
         if (s.contains("services") && s["services"].is_array())
             for (auto& v : s["services"]) {
@@ -1074,6 +1157,34 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 r["fuel2_units"] = gas_at.count(sid) ? gas_at[sid] : 0.0;
             else if (ty.rfind("Ansiblex", 0) == 0 || ty.rfind("Pharolux", 0) == 0)
                 r["fuel2_units"] = ozone_at.count(sid) ? ozone_at[sid] : 0.0;
+            if (ty == "Metenox Moon Drill") {
+                // mined output sitting in the moon material bay, priced at the
+                // public market average
+                double tm3 = 0, tisk = 0;
+                std::vector<json> items;
+                if (goo_at.count(sid)) {
+                    std::lock_guard<std::mutex> vl(s_val_mtx);
+                    for (auto& tq : goo_at[sid]) {
+                        auto& ti = s_type[tq.first];
+                        double m3 = ti.second * tq.second;
+                        double isk = (s_price.count(tq.first) ? s_price[tq.first] : 0.0) *
+                                     tq.second;
+                        tm3 += m3;
+                        tisk += isk;
+                        items.push_back({{"name", ti.first},
+                                         {"qty", tq.second},
+                                         {"m3", m3},
+                                         {"isk", isk}});
+                    }
+                }
+                std::sort(items.begin(), items.end(), [](const json& a, const json& b) {
+                    return a.value("isk", 0.0) > b.value("isk", 0.0);
+                });
+                r["goo_m3"] = tm3;
+                r["goo_isk"] = tisk;
+                r["goo_capacity"] = 500000.0;  // Metenox moon material storage m3
+                r["goo"] = items;
+            }
         }
         out["structures"].push_back(std::move(r));
     }
@@ -1095,6 +1206,37 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             if (hst == 200 && hj.contains("refuels") && hj["refuels"].is_array())
                 out["refuels"] = hj["refuels"];
         } catch (...) { /* history is best-effort; the live table never waits on it */ }
+    }
+
+    // corp-kept vs rented-out classification from the moon-rental ticket API.
+    // Matched by in-game structure name against the ticket's recorded name;
+    // the (C)/(P) naming-convention suffix covers renamed/unticketed ones.
+    if (corp_id == g_rentals_corp && !g_rentals_api.empty()) {
+        try {
+            int rst = 0;
+            json rj = json::parse(http_get(g_rentals_api, g_rentals_token, rst));
+            if (rst == 200 && rj.contains("rentals") && rj["rentals"].is_array()) {
+                std::map<std::string, std::pair<std::string, std::string>> by_name;
+                for (auto& t : rj["rentals"])
+                    by_name[t.value("station_name", "")] = {t.value("type", ""),
+                                                            t.value("renter", "")};
+                for (auto& r : out["structures"]) {
+                    std::string nm = r.value("name", ""), ty, renter;
+                    auto it = by_name.find(nm);
+                    if (it != by_name.end()) {
+                        ty = it->second.first;
+                        renter = it->second.second;
+                    } else if (nm.find("(P)") != std::string::npos) {
+                        ty = "private";
+                    } else if (nm.find("(C)") != std::string::npos) {
+                        ty = "corp";
+                    }
+                    if (!ty.empty()) r["rental"] = ty;
+                    if (ty == "private" && !renter.empty()) r["renter"] = renter;
+                }
+                out["rentals_online"] = true;
+            }
+        } catch (...) { /* classification is best-effort */ }
     }
     return out.dump();
 } catch (...) {

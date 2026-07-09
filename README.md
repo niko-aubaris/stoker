@@ -53,6 +53,21 @@ point it at your own server (two endpoints: `POST /report`,
 service is rate-limited per IP - far above the app's normal polling,
 but don't hammer it.
 
+**Timers and moon pulls (GUI):** every row shows shield/armor/hull dots and
+a reinforcement countdown ("Timer: NONE" when safe). Athanors and Tataras
+get a "Moon Pull:" countdown, then POPPED for 24h after the chunk lands,
+then RESET when a new extraction needs scheduling. Moon pulls need the
+`esi-industry.read_corporation_mining.v1` scope on your login (re-login to
+grant) plus the in-game Station Manager or Director role. Metenox rows also
+meter the moon material bay with its estimated market value.
+
+**Local awareness (GUI):** the map can overlay your pilots' positions and
+hostile intel by tailing the EVE client's own chat logs, SMT-style, no ESI
+involved. Auto-detects `Documents/EVE/logs`; set `"eve_logs"` in
+config.json for a custom path and `"intel_channels": ["..."]` to name
+intel channels explicitly (default: any channel with "intel" in its name).
+Intel systems ring red on the map and their fuel-table rows flag red.
+
 **Updates:** on startup STOKER checks the newest GitHub release once; if
 a newer version exists the header offers it and `u` downloads and swaps
 the binary in place (restart to run it). Set `"update_check": false` in
