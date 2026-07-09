@@ -33,6 +33,16 @@ in-game Director role. Anything short of that shows "?". Burn rates, bay estimat
 refuel log are computed server-side by a hosted STOKER backend and show as
 unknown without one.
 
+**Persistent refuel log (standalone):** ESI has no "someone fueled this"
+event and the app keeps no database, so each poll reports the structure
+list + fuel clocks it just pulled to a small history service, which diffs
+snapshots over time and serves back your corp's refuel log (the `f` view).
+The report contains exactly what your own ESI view returned: structure
+ids, names, systems, and fuel expiry times, nothing else, no tokens.
+Privacy switch: set `"history_api": ""` in config.json to disable, or
+point it at your own server (two endpoints: `POST /report`,
+`GET /refuels?corp_id=`; see the STOKER backend source).
+
 **Multiple corps:** press `alt+c` in the app (or run `stoker --add`) to log
 in another character. Every corp your characters can read gets its own tab
 (labeled by corp ticker); press `c` to switch. With access to just one corp there is no tab bar,

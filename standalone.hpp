@@ -44,6 +44,11 @@ static const char* SCOPE = "esi-corporations.read_structures.v1";
 // dev app allows more (e.g. + esi-assets.read_corporation_assets.v1 for the
 // 2ND FUEL column) can ask for it without changing everyone's default.
 static std::string g_scopes = SCOPE;
+// Refuel-history service: standalone clients have no storage, so each poll
+// reports its snapshot here and reads back the refuel log the server builds
+// by diffing snapshots over time. Keyless, scoped per corp; config
+// "history_api" overrides, empty string disables. See README (privacy note).
+static std::string g_history_api = "https://api.escalateanyways.com/market/stoker";
 
 // --- sha256 (for the PKCE code challenge) -----------------------------------
 struct Sha256 {
@@ -212,10 +217,18 @@ static std::string http_post_form(const std::string& url, const std::string& bod
 }
 
 static std::string http_post_json(const std::string& url, const std::string& body) {
+    // body goes through a temp file: JSON is full of double quotes, which a
+    // double-quoted shell argument cannot carry (and @file keeps the payload
+    // off the process command line)
+    auto tmp = config_dir() / ("post-" + random_token(6) + ".json");
+    { std::ofstream f(tmp); f << body; }
     std::string cmd = "curl -s --compressed --max-time 20 -X POST "
                       "-H \"Content-Type: application/json\" "
-                      "-d \"" + body + "\" \"" + url + "\"" QUIET;
-    return run_cmd(cmd.c_str());
+                      "--data @\"" + tmp.string() + "\" \"" + url + "\"" QUIET;
+    std::string out = run_cmd(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    return out;
 }
 
 // GET with response headers; returns body, fills status + wanted headers.
@@ -731,6 +744,25 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 r["fuel2_units"] = ozone_at.count(sid) ? ozone_at[sid] : 0.0;
         }
         out["structures"].push_back(std::move(r));
+    }
+
+    // persistent refuel log via the history service: report what this poll
+    // saw, read back everything the server has accumulated for this corp
+    if (!g_history_api.empty()) {
+        try {
+            json rep = {{"corp_id", corp_id}, {"structures", json::array()}};
+            for (auto& r : out["structures"])
+                rep["structures"].push_back({{"structure_id", r.value("structure_id", 0LL)},
+                                             {"name", r.value("name", "")},
+                                             {"system", r.value("system", "")},
+                                             {"fuel_expires", r.value("fuel_expires", "")}});
+            http_post_json(g_history_api + "/report", rep.dump());
+            int hst = 0;
+            json hj = json::parse(http_get(g_history_api + "/refuels?corp_id=" +
+                                               std::to_string(corp_id), "", hst));
+            if (hst == 200 && hj.contains("refuels") && hj["refuels"].is_array())
+                out["refuels"] = hj["refuels"];
+        } catch (...) { /* history is best-effort; the live table never waits on it */ }
     }
     return out.dump();
 } catch (...) {

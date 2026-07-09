@@ -488,6 +488,13 @@ static void ingest(const std::string& raw) {
             v.days_added = e["days_added"].get<double>();
         refuels.push_back(std::move(v));
     } catch (const std::exception&) {}
+    for (auto& v : refuels)
+        if (v.blocks < 0 && v.days_added > 0 && v.sid)
+            for (auto& r : rows)
+                if (r.sid == v.sid) {
+                    if (r.bpd > 0) v.blocks = std::round(v.days_added * r.bpd);
+                    break;
+                }
     std::lock_guard<std::mutex> l(g_mtx);
     g_rows = std::move(rows);
     g_refuels = std::move(refuels);
@@ -569,6 +576,8 @@ static bool load_or_setup(bool force_corp) {
     if ((e = std::getenv("STOKER_CLIENT_ID")) && *e) cfg["client_id"] = e;
     if (cfg.contains("scopes") && cfg["scopes"].is_string())
         standalone::g_scopes = cfg["scopes"].get<std::string>();
+    if (cfg.contains("history_api") && cfg["history_api"].is_string())
+        standalone::g_history_api = cfg["history_api"].get<std::string>();
     if (cfg.contains("tab_type_filter") && cfg["tab_type_filter"].is_object())
         for (auto& [k, v] : cfg["tab_type_filter"].items())
             if (v.is_string()) g_tab_default_filter[k] = v.get<std::string>();
@@ -1119,10 +1128,10 @@ int main(int argc, char** argv) {
                 body.push_back(line);
             }
             if (n == 0)
-                body.push_back(text(g_standalone
-                    ? "  (refuel history is a corp-mode feature - it needs a hosted backend"
-                      " watching fuel_expires over time; ESI alone has no deposit events)"
-                    : "  (no refuels seen yet - events appear as the 30-min diffs catch them)")
+                body.push_back(text(g_standalone && standalone::g_history_api.empty()
+                    ? "  (refuel history is off - set \"history_api\" in the config; ESI"
+                      " alone has no deposit events)"
+                    : "  (no refuels seen yet - the log fills in as polls catch fuel jumps)")
                     | color(Color::RGB(128, 136, 150)));
             if (sel >= 0 && sel < n) {
                 const Refuel& v = refuels[sel];
