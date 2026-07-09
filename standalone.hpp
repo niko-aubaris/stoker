@@ -219,16 +219,62 @@ static void save_json_file(const std::filesystem::path& p, const json& j) {
 static std::string g_curl_extra;  // sticky flags that made curl work on this box
 static std::string curl_flags() { return g_curl_extra.empty() ? std::string() : g_curl_extra + " "; }
 
+#ifdef _WIN32
+// Browsers use the Windows proxy settings; curl does not. On proxy-required
+// networks curl's direct connection is killed mid-handshake while the browser
+// works, so read the user's configured proxy and offer it to the fallbacks.
+static std::string win_system_proxy() {
+    std::string q = run_cmd(
+        "reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\""
+        QUIET);
+    if (q.find("ProxyEnable") == std::string::npos) return "";
+    size_t en = q.find("ProxyEnable");
+    size_t line_end = q.find('\n', en);
+    if (q.substr(en, line_end - en).find("0x1") == std::string::npos) return "";
+    size_t ps = q.find("ProxyServer");
+    if (ps == std::string::npos) return "";
+    size_t reg_sz = q.find("REG_SZ", ps);
+    if (reg_sz == std::string::npos) return "";
+    size_t v0 = q.find_first_not_of(" \t", reg_sz + 6);
+    size_t v1 = q.find_first_of("\r\n", v0);
+    if (v0 == std::string::npos) return "";
+    std::string server = q.substr(v0, v1 - v0);
+    // "host:port" or per-protocol "http=...;https=host:port;ftp=..."
+    size_t https = server.find("https=");
+    if (https != std::string::npos) {
+        size_t end = server.find(';', https);
+        server = server.substr(https + 6, end == std::string::npos ? std::string::npos
+                                                                   : end - https - 6);
+    } else if (server.find('=') != std::string::npos) {
+        size_t http = server.find("http=");
+        if (http == std::string::npos) return "";
+        size_t end = server.find(';', http);
+        server = server.substr(http + 5, end == std::string::npos ? std::string::npos
+                                                                  : end - http - 5);
+    }
+    for (char c : server)  // registry data only, but it rides a shell command
+        if (!(isalnum((unsigned char)c) || c == '.' || c == ':' || c == '-')) return "";
+    return server;
+}
+#endif
+
 static std::string run_curl(const std::string& args) {
     std::string out = run_cmd(("curl -s " + curl_flags() + args + QUIET).c_str());
 #ifdef _WIN32
     if (out.empty()) {
-        // escalating fallbacks for broken-TLS-interception setups: revocation
-        // checks first (cheap, common), then forcing TLS 1.2 for middleboxes
-        // that fumble the 1.3 handshake
-        for (const char* f : {"--ssl-no-revoke", "--ssl-no-revoke --tlsv1.2 --tls-max 1.2"}) {
+        // escalating fallbacks for broken-TLS setups: revocation checks first
+        // (cheap, common), forced TLS 1.2 for middleboxes that fumble 1.3,
+        // then the Windows system proxy that browsers use and curl ignores
+        std::vector<std::string> tries = {"--ssl-no-revoke",
+                                          "--ssl-no-revoke --tlsv1.2 --tls-max 1.2"};
+        std::string prx = win_system_proxy();
+        if (!prx.empty()) {
+            tries.push_back("--proxy \"" + prx + "\"");
+            tries.push_back("--proxy \"" + prx + "\" --ssl-no-revoke");
+        }
+        for (auto& f : tries) {
             if (g_curl_extra == f) continue;
-            out = run_cmd(("curl -s " + std::string(f) + " " + args + QUIET).c_str());
+            out = run_cmd(("curl -s " + f + " " + args + QUIET).c_str());
             if (!out.empty()) { g_curl_extra = f; break; }
         }
     }
