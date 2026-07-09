@@ -212,11 +212,38 @@ static void save_json_file(const std::filesystem::path& p, const json& j) {
 }
 
 // --- tiny HTTP helpers (curl subprocess, same approach as corp mode) ---------
+// Windows' schannel curl fails outright on networks where certificate
+// revocation checks can't complete (AV https-scanning, VPNs, some home
+// routers). When a request comes back empty there, retry once with
+// --ssl-no-revoke and stick with it for the session.
+static bool g_ssl_no_revoke = false;
+static std::string curl_flags() { return g_ssl_no_revoke ? "--ssl-no-revoke " : ""; }
+
+static std::string run_curl(const std::string& args) {
+    std::string out = run_cmd(("curl -s " + curl_flags() + args + QUIET).c_str());
+#ifdef _WIN32
+    if (out.empty() && !g_ssl_no_revoke) {
+        g_ssl_no_revoke = true;
+        out = run_cmd(("curl -s --ssl-no-revoke " + args + QUIET).c_str());
+        if (out.empty()) g_ssl_no_revoke = false;
+    }
+#endif
+    return out;
+}
+
+// What went wrong: rerun with errors visible and pull curl's own message.
+static std::string curl_error(const std::string& args) {
+    std::string raw = run_cmd(("curl -sS " + curl_flags() + args + " 2>&1").c_str());
+    size_t at = raw.find("curl: (");
+    if (at == std::string::npos) return "no reply";
+    size_t end = raw.find('\n', at);
+    return raw.substr(at, end == std::string::npos ? std::string::npos : end - at);
+}
+
 static std::string http_post_form(const std::string& url, const std::string& body) {
-    std::string cmd = "curl -s --max-time 20 -X POST "
-                      "-H \"Content-Type: application/x-www-form-urlencoded\" "
-                      "-d \"" + body + "\" \"" + url + "\"" QUIET;
-    return run_cmd(cmd.c_str());
+    return run_curl("--max-time 20 -X POST "
+                    "-H \"Content-Type: application/x-www-form-urlencoded\" "
+                    "-d \"" + body + "\" \"" + url + "\"");
 }
 
 static std::string http_post_json(const std::string& url, const std::string& body) {
@@ -225,10 +252,9 @@ static std::string http_post_json(const std::string& url, const std::string& bod
     // off the process command line)
     auto tmp = config_dir() / ("post-" + random_token(6) + ".json");
     { std::ofstream f(tmp); f << body; }
-    std::string cmd = "curl -s --compressed --max-time 20 -X POST "
-                      "-H \"Content-Type: application/json\" "
-                      "--data @\"" + tmp.string() + "\" \"" + url + "\"" QUIET;
-    std::string out = run_cmd(cmd.c_str());
+    std::string out = run_curl("--compressed --max-time 20 -X POST "
+                                "-H \"Content-Type: application/json\" "
+                                "--data @\"" + tmp.string() + "\" \"" + url + "\"");
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     return out;
@@ -237,10 +263,10 @@ static std::string http_post_json(const std::string& url, const std::string& bod
 // GET with response headers; returns body, fills status + wanted headers.
 static std::string http_get(const std::string& url, const std::string& bearer,
                             int& status, json* headers_out = nullptr) {
-    std::string cmd = "curl -s -i --compressed --max-time 30 ";
-    if (!bearer.empty()) cmd += "-H \"Authorization: Bearer " + bearer + "\" ";
-    cmd += "\"" + url + "\"" QUIET;
-    std::string raw = run_cmd(cmd.c_str());
+    std::string args = "-i --compressed --max-time 30 ";
+    if (!bearer.empty()) args += "-H \"Authorization: Bearer " + bearer + "\" ";
+    args += "\"" + url + "\"";
+    std::string raw = run_curl(args);
     status = 0;
     const char* seps[] = {"\r\n\r\n", "\n\n"};  // some pipes eat the \r
     size_t sep = std::string::npos;
@@ -443,7 +469,11 @@ static bool login(const std::string& client_id, std::string& err,
         if (!sv("error").empty())
             err = "token exchange failed: " + sv("error") + " " + sv("error_description");
         else if (resp.empty())
-            err = "token exchange failed: no reply from login.eveonline.com";
+            err = "token exchange failed: " +
+                  curl_error("--max-time 20 -X POST "
+                             "-H \"Content-Type: application/x-www-form-urlencoded\" "
+                             "-d \"" + body + "\" \"" + std::string(SSO_TOKEN_URL) + "\"") +
+                  " (a VPN, proxy, or antivirus intercepting HTTPS is the usual cause)";
         else
             err = "token exchange failed: login.eveonline.com sent an HTTP error page "
                   "instead of a token (usually an app-registration problem on "

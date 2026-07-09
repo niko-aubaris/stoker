@@ -320,7 +320,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.1.0";
+static const char* STOKER_VERSION = "v1.1.1";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -397,7 +397,8 @@ static std::string apply_update(const std::string& tag, const std::string& url) 
     auto pkg = dir / "pkg.tar.gz";
 #endif
     auto fresh = dir / exe.filename();  // stoker or stoker-gui, whichever we are
-    run_cmd(("curl -sL --max-time 120 -o \"" + pkg.string() + "\" \"" + url + "\"" QUIET).c_str());
+    run_cmd(("curl -sL " + standalone::curl_flags() + "--max-time 120 -o \"" +
+             pkg.string() + "\" \"" + url + "\"" QUIET).c_str());
     if (!std::filesystem::exists(pkg) || std::filesystem::file_size(pkg, ec) < 100000)
         return "update failed: download incomplete";
     // Windows 10+ ships bsdtar as tar.exe, which also reads zip
