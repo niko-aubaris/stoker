@@ -139,6 +139,10 @@ static std::string g_status = "connecting to the box...";
 static std::string g_note;         // last claim result, shown for a few seconds
 static time_t g_note_at = 0;
 static std::atomic<bool> g_run{true};
+// GUI build: poked after PostEvent so the GLFW loop redraws; the console
+// login prompt is also deferred into the window (see main).
+static void (*g_gui_wake)() = nullptr;
+static bool g_defer_login = false;
 static std::atomic<bool> g_busy{false};
 
 // short-lived background workers (refresh / claim / login). Joined before
@@ -307,13 +311,16 @@ static time_t parse_iso(const std::string& s) {
 }
 
 #include "standalone.hpp"  // needs run_cmd/urlenc/parse_iso above
+#ifdef STOKER_GUI
+#include "gui_host.hpp"  // native-window host for the same component
+#endif
 
 // --- self-update against GitHub releases --------------------------------------
 // Startup checks the latest release once (config "update_check": false skips);
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v1.0.6";
+static const char* STOKER_VERSION = "v1.1.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -386,11 +393,10 @@ static std::string apply_update(const std::string& tag, const std::string& url) 
     std::filesystem::create_directories(dir, ec);
 #ifdef _WIN32
     auto pkg = dir / "pkg.zip";
-    auto fresh = dir / "stoker.exe";
 #else
     auto pkg = dir / "pkg.tar.gz";
-    auto fresh = dir / "stoker";
 #endif
+    auto fresh = dir / exe.filename();  // stoker or stoker-gui, whichever we are
     run_cmd(("curl -sL --max-time 120 -o \"" + pkg.string() + "\" \"" + url + "\"" QUIET).c_str());
     if (!std::filesystem::exists(pkg) || std::filesystem::file_size(pkg, ec) < 100000)
         return "update failed: download incomplete";
@@ -779,6 +785,7 @@ static bool load_or_setup(bool force_corp) {
 
     g_standalone = true;
     if (!standalone::have_login()) {
+        if (g_defer_login) return true;  // GUI runs the login inside the window
         std::string err;
         if (!standalone::login(g_client_id, err)) {
             std::fprintf(stderr, "EVE login failed: %s\n", err.c_str());
@@ -794,6 +801,10 @@ int main(int argc, char** argv) {
     // Box-drawing glyphs come out as mojibake without a UTF-8 console.
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#endif
+#ifdef STOKER_GUI
+    g_defer_login = true;                      // SSO runs inside the window
+    g_gui_wake = [] { glfwPostEmptyEvent(); };  // benign before glfwInit
 #endif
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::printf("STOKER %s\n", STOKER_VERSION);
@@ -812,8 +823,14 @@ int main(int argc, char** argv) {
             "Install it with your package manager (e.g. sudo apt install curl).\n"
 #endif
             "\n[press Enter to close]");
+#if defined(_WIN32) && defined(STOKER_GUI)
+        MessageBoxA(nullptr, "STOKER needs curl.exe, which ships with Windows 10 "
+                    "version 1803 and later. Update Windows or install curl from "
+                    "https://curl.se/windows/", "STOKER", MB_ICONERROR);
+#else
         std::string pause;
         std::getline(std::cin, pause);
+#endif
         return 1;
     }
     {   // clear the renamed-aside exe a Windows self-update leaves behind
@@ -901,7 +918,8 @@ int main(int argc, char** argv) {
             else
                 ingest(run_cmd(g_refresh_cmd.c_str()));
             g_busy = false;
-            if (g_run) screen.PostEvent(Event::Custom);
+            if (g_run) if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
         });
     };
 
@@ -923,7 +941,8 @@ int main(int argc, char** argv) {
             bool ok = standalone::login(g_client_id, err, &name, [&](const std::string& s) {
                 std::lock_guard<std::mutex> l(g_mtx);
                 g_status = s;
-                screen.PostEvent(Event::Custom);
+                if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
             });
             {
                 std::lock_guard<std::mutex> l(g_mtx);
@@ -933,7 +952,8 @@ int main(int argc, char** argv) {
             }
             if (ok) standalone_cycle();  // new corp becomes a tab right away
             g_busy = false;
-            if (g_run) screen.PostEvent(Event::Custom);
+            if (g_run) if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
         });
     };
 
@@ -979,7 +999,8 @@ int main(int argc, char** argv) {
             }
             ingest(run_cmd(g_fetch_cmd.c_str()));
             g_busy = false;
-            screen.PostEvent(Event::Custom);
+            if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
         });
     };
 
@@ -1576,7 +1597,8 @@ int main(int argc, char** argv) {
                         if (res.rfind("updated", 0) == 0) g_update_tag.clear();
                     }
                     g_busy = false;
-                    if (g_run) screen.PostEvent(Event::Custom);
+                    if (g_run) if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
                 });
             }
             return true;
@@ -1636,12 +1658,22 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (++slow >= 10) {
                 slow = 0;
-                screen.PostEvent(Event::Custom);
+                if (g_gui_wake) g_gui_wake();
+            else screen.PostEvent(Event::Custom);
             }
         }
     });
 
+#ifdef STOKER_GUI
+    // no stored login yet: run the browser SSO now, progress in the window
+    if (g_standalone && !standalone::have_login()) add_character();
+    {
+        GLFWwindow* gw = nullptr;
+        gui::run(component, g_run, &gw);
+    }
+#else
     screen.Loop(component);
+#endif
     g_run = false;
     if (th.joinable()) th.join();
     {

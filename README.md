@@ -19,6 +19,12 @@ Needs Windows 10 version 1803+ (`curl.exe` ships with the OS).
 **Linux:** untar `stoker-linux-x86_64.tar.gz` and run `./stoker`. Static
 binary, needs only `curl` installed.
 
+**Prefer a real window over a console?** Both archives also contain
+`stoker-gui` / `stoker-gui.exe`: the identical dashboard in its own
+native window (no terminal at all - on Windows it launches without a
+console). Same keys, same config, same login; the first run opens the
+EVE browser login with progress shown in the window.
+
 First run opens your browser for an EVE login; approve the single
 (read-only) structure permission and the dashboard appears. That's the
 whole setup: the refresh token is kept locally so it's a one-time dance.
