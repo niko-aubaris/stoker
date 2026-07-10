@@ -693,6 +693,7 @@ int main(int argc, char** argv) {
         std::string status, note, corpname, upd, updurl, pulled, esiMod;
         int tabsel;
         bool rentals_online, extractions_ok;
+        std::vector<Notif> notifs;
         {
             std::lock_guard<std::mutex> l(g_mtx);
             rows = g_rows;
@@ -701,6 +702,7 @@ int main(int argc, char** argv) {
             tabsel = g_tab;
             rentals_online = g_rentals_online;
             extractions_ok = g_extractions_ok;
+            notifs = g_notifs;
             status = g_status;
             corpname = g_corp_name;
             upd = g_update_tag;
@@ -1036,9 +1038,24 @@ int main(int argc, char** argv) {
         // filter
         ImGui::SetNextItemWidth(260);
         ImGui::InputTextWithHint("##filter", "filter name/system/type", filter, sizeof filter);
+        // recent structure notifications, matched per row
+        time_t nowt0 = time(nullptr);
+        auto notif_flag = [&](long long sid, std::initializer_list<const char*> types,
+                              long maxage) {
+            for (auto& n : notifs) {
+                if (n.sid != sid || !n.at || nowt0 - n.at > maxage) continue;
+                for (auto* t : types)
+                    if (n.type == t) return true;
+            }
+            return false;
+        };
+        auto row_gone = [&](const Row& r) {  // automated removal signals
+            return r.state == "unanchored" ||
+                   notif_flag(r.sid, {"StructureDestroyed"}, 48 * 3600);
+        };
         int suppressed = 0;
         for (auto& r : rows)
-            if (r.state == "unanchored") suppressed++;
+            if (row_gone(r)) suppressed++;
         if (suppressed) {
             ImGui::SameLine();
             char hl[48];
@@ -1070,14 +1087,33 @@ int main(int argc, char** argv) {
         ImGui::SameLine();
         ImGui::TextColored(u7 ? ImVec4(1, 0.27f, 0.27f, 1) : ImVec4(0.35f, 0.88f, 0.51f, 1), "%d", u7);
 
+        // brand-new structures the hourly list has not rolled in yet
+        {
+            std::map<long long, bool> have;
+            for (auto& r : rows) have[r.sid] = true;
+            for (auto& n : notifs) {
+                if (n.type != "StructureAnchoring" || !n.at || nowt0 - n.at > 24 * 3600)
+                    continue;
+                if (n.sid && have.count(n.sid)) continue;
+                load_universe();
+                std::string sys = g_sysname.count((int)n.system_id)
+                                      ? g_sysname[(int)n.system_id]
+                                      : "?";
+                ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1),
+                                   "new structure anchoring in %s - full data lands on the "
+                                   "next ESI roll",
+                                   sys.c_str());
+            }
+        }
+
         // filtered view
         std::string f = filter;
         for (auto& c : f) c = (char)tolower((unsigned char)c);
         std::vector<const Row*> view;
         for (auto& r : rows) {
-            // automated removal: fully-unanchored hulls drop out on their own
-            // (destroyed ones leave the ESI feed by themselves)
-            if (!g_show_hidden && r.state == "unanchored") continue;
+            // automated removal: fully-unanchored hulls and freshly-destroyed
+            // structures (notification beats the hourly list) drop on their own
+            if (!g_show_hidden && row_gone(r)) continue;
             if (rentals_online && g_corp_only && r.rental == "private") continue;
             if (!g_type_tab.empty() && r.type != g_type_tab) continue;
             if (!f.empty()) {
@@ -1256,7 +1292,15 @@ int main(int argc, char** argv) {
                         const char* wtxt = nullptr;
                         ImU32 wcol = 0;
                         time_t ua = r.unanchors_at.empty() ? 0 : parse_iso(r.unanchors_at);
-                        if (r.state == "armor_reinforce" || r.state == "hull_reinforce" ||
+                        if (notif_flag(r.sid,
+                                       {"StructureUnderAttack", "StructureLostShields",
+                                        "StructureLostArmor"},
+                                       1800)) {
+                            // notification-fed: fires within ~10 min of the hit,
+                            // long before the hourly structure state catches up
+                            wtxt = "UNDER ATTACK";
+                            wcol = IM_COL32(255, 70, 70, 255);
+                        } else if (r.state == "armor_reinforce" || r.state == "hull_reinforce" ||
                             r.state == "armor_vulnerable" || r.state == "hull_vulnerable") {
                             wtxt = "UNDER ATTACK";
                             wcol = IM_COL32(255, 70, 70, 255);
