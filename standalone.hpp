@@ -165,6 +165,11 @@ static std::string g_history_api = "https://api.escalateanyways.com/market/stoke
 static std::string g_rentals_api, g_rentals_token;
 static long long g_rentals_corp = 98695839;  // SOUSN
 
+// Skyhook watch feed (watchlist + income + live theft windows + raid stats),
+// served by the corp backend. config "skyhooks_api"; empty = off. Shown on
+// the same corp tab as the rentals feed.
+static std::string g_skyhooks_api;
+
 // --- sha256 (for the PKCE code challenge) -----------------------------------
 struct Sha256 {
     uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -1280,6 +1285,16 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             }
         } catch (...) { /* classification is best-effort */ }
     }
+    // the corp's watched skyhooks ride along on the same tab
+    if (corp_id == g_rentals_corp && !g_skyhooks_api.empty()) {
+        try {
+            int kst = 0;
+            json kj = json::parse(http_get(g_skyhooks_api, "", kst));
+            if (kst == 200 && kj.contains("skyhooks") && kj["skyhooks"].is_array())
+                out["skyhooks"] = kj["skyhooks"];
+        } catch (...) { /* best-effort */ }
+    }
+
     // structure notifications: a much faster signal than the hourly corp
     // structures dataset (attacks land within ~10 min, plus anchoring and
     // destruction events the list itself won't show until the next roll)

@@ -411,6 +411,31 @@ static void timer_info(const Row& r, std::string& txt, ImU32& col) {
     col = mix_u32(IM_COL32(250, 215, 70, 255), IM_COL32(255, 70, 70, 255), (float)frac);
 }
 
+// skyhook theft window: counts down toward the window opening (danger
+// approaching, yellow -> red over the ~4h ESI announce lead); while the
+// window is OPEN the remaining time shows in red and `open` is set so the
+// caller can flash RAIDABLE. Grey "none" when no window is announced.
+static void skyhook_timer_info(const Row& r, std::string& txt, ImU32& col, bool& open) {
+    open = false;
+    time_t nowt = time(nullptr);
+    time_t ws = r.sky_wstart.empty() ? 0 : parse_iso(r.sky_wstart);
+    time_t we = r.sky_wend.empty() ? 0 : parse_iso(r.sky_wend);
+    if (ws && we && nowt >= ws && nowt < we) {
+        open = true;
+        txt = fmt_dur((double)(we - nowt)) + " left";
+        col = IM_COL32(255, 70, 70, 255);
+        return;
+    }
+    if (ws && nowt < ws) {
+        double frac = 1.0 - std::min(1.0, (double)(ws - nowt) / (4 * 3600.0));
+        txt = fmt_dur((double)(ws - nowt));
+        col = mix_u32(IM_COL32(250, 215, 70, 255), IM_COL32(255, 70, 70, 255), (float)frac);
+        return;
+    }
+    txt = "none";
+    col = kGreyU32;
+}
+
 // Athanor/Tatara moon pull: countdown runs yellow -> green toward arrival
 // (the pull landing is good news), then POPPED for 24h, then RESET.
 static void moonpull_info(const Row& r, bool extr_ok, std::string& txt, ImU32& col) {
@@ -451,7 +476,9 @@ static void dual_gauge(const Row& r, float w) {
     char b[32];
     std::snprintf(b, sizeof b, "%.1fd", r.days);
     ImTextureID ic2 = r.gas_day > 0 ? g_ic_gas : g_ic_ozone;
-    if (!r.has_fuel)
+    if (r.is_skyhook)  // skyhooks burn nothing: hatched NA across the board
+        mini_bar(dl, p, w, h, -1, "NA", "", false, 0);
+    else if (!r.has_fuel)
         mini_bar(dl, p, w, h, -1, "--", "", false, g_ic_fuel);
     else
         mini_bar(dl, p, w, h, r.days / GAUGE_DAYS, b, to30(units_raw(r)), false, g_ic_fuel);
@@ -1275,7 +1302,8 @@ int main(int argc, char** argv) {
                     // fuel = Abandoned; all services off while fueled = Offline.
                     // Structures still anchoring/onlining (or already
                     // unanchored) have no fuel clock BY DESIGN: no false badge.
-                    bool limbo = r.state == "anchoring" || r.state == "anchor_vulnerable" ||
+                    bool limbo = r.is_skyhook || r.state == "anchoring" ||
+                                 r.state == "anchor_vulnerable" ||
                                  r.state == "deploy_vulnerable" ||
                                  r.state == "fitting_invulnerable" ||
                                  r.state == "onlining_vulnerable" || r.state == "unanchored";
@@ -1359,6 +1387,38 @@ int main(int argc, char** argv) {
                         w_moonpull = fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x;
                     }
                     float tx = cp.x + ix + 13 + w_armour + 18;
+                    if (r.is_skyhook) {
+                        // Window: countdown, Income: figures, flashing RAIDABLE
+                        std::string tt;
+                        ImU32 tc;
+                        bool open_ = false;
+                        skyhook_timer_info(r, tt, tc, open_);
+                        dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
+                                     "Window:");
+                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0), tc, tt.c_str());
+                        dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
+                                     "Income:");
+                        std::string inc =
+                            r.sky_hourly >= 0
+                                ? commas(r.sky_hourly) + "/h  " + commas(r.sky_rent) + "/mo rent"
+                                : "?";
+                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
+                                     IM_COL32(200, 206, 222, 255), inc.c_str());
+                        if (open_) {
+                            g_flash_active = true;
+                            int wa = (int)(90 +
+                                           165 * (0.5 + 0.5 * std::sin(ImGui::GetTime() * 6.0)));
+                            warn_tri(dl2, ImVec2(tx, y0 + 2 * sp + 1), fs - 2,
+                                     IM_COL32(255, 70, 70, 255), wa);
+                            dl2->AddText(fnt, fs, ImVec2(tx + fs + 4, y0 + 2 * sp),
+                                         IM_COL32(255, 70, 70, wa), "RAIDABLE");
+                        } else if (r.sky_streak >= 0) {
+                            char st[48];
+                            std::snprintf(st, sizeof st, "unraided x%d", r.sky_streak);
+                            dl2->AddText(fnt, fs, ImVec2(tx, y0 + 2 * sp),
+                                         IM_COL32(128, 136, 150, 255), st);
+                        }
+                    } else {
                     {
                         dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
                                      "Timer:");
@@ -1422,6 +1482,7 @@ int main(int argc, char** argv) {
                                          (wcol & 0xFFFFFF) | ((ImU32)wa << 24), wtxt);
                         }
                     }
+                    }  // end non-skyhook branch
                 }
             }
             ImGui::EndTable();
@@ -1461,6 +1522,29 @@ int main(int argc, char** argv) {
                     {
                         std::string tt;
                         ImU32 tc;
+                        if (d->is_skyhook) {
+                            bool open_ = false;
+                            skyhook_timer_info(*d, tt, tc, open_);
+                            ImGui::TextColored(GREY_, "Theft window:");
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tc), "%s%s",
+                                               tt.c_str(), open_ ? "  RAIDABLE NOW" : "");
+                            if (d->sky_hourly >= 0) {
+                                ImGui::TextColored(GREY_, "Income:");
+                                ImGui::SameLine();
+                                ImGui::TextColored(TEXTC, "%s ISK/h", commas(d->sky_hourly).c_str());
+                                ImGui::TextColored(GREY_, "Rent:");
+                                ImGui::SameLine();
+                                ImGui::TextColored(TEXTC, "%s ISK/mo",
+                                                   commas(d->sky_rent).c_str());
+                            }
+                            if (d->sky_unraided >= 0)
+                                ImGui::TextColored(GREY_,
+                                                   "record: %d unraided / %d raided, "
+                                                   "unraided x%d in a row",
+                                                   d->sky_unraided, d->sky_raided,
+                                                   d->sky_streak < 0 ? 0 : d->sky_streak);
+                        } else {
                         timer_info(*d, tt, tc);
                         ImGui::TextColored(GREY_, "Timer:");
                         ImGui::SameLine();
@@ -1473,6 +1557,7 @@ int main(int argc, char** argv) {
                             ImGui::SameLine();
                             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(mc), "%s",
                                                mt.c_str());
+                        }
                         }
                     }
                     ImGui::Separator();

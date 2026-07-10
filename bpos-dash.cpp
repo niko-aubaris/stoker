@@ -112,6 +112,10 @@ struct Row {
     std::string extraction_start, chunk_arrival;     // Athanor/Tatara moon pull (ISO)
     std::string unanchors_at;         // set while unanchoring (ISO)
     int sv_on = -1, sv_off = -1;      // service counts; -1 = feed doesn't say
+    bool is_skyhook = false;          // watched skyhook row (no fuel, theft windows)
+    double sky_hourly = -1, sky_rent = -1;  // income figures from the watchlist
+    int sky_streak = -1, sky_unraided = -1, sky_raided = -1;
+    std::string sky_wstart, sky_wend;       // current/next theft window (ISO)
     std::vector<RefuelEvent> log;     // this structure's last refuel events
 };
 
@@ -526,7 +530,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.6.2";
+static const char* STOKER_VERSION = "v2.7.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -871,6 +875,31 @@ static void ingest(const std::string& raw) {
                     if (r.bpd > 0) v.blocks = std::round(v.days_added * r.bpd);
                     break;
                 }
+    // watched skyhooks join the table as fuel-less rows
+    for (auto& s : d.value("skyhooks", json::array())) try {
+        Row r;
+        r.is_skyhook = true;
+        if (s.contains("planet_id") && s["planet_id"].is_number())
+            r.sid = s["planet_id"].get<long long>();
+        auto sstr = [&s](const char* k) -> std::string {
+            return (s.contains(k) && s[k].is_string()) ? s[k].get<std::string>() : "";
+        };
+        auto snum = [&s](const char* k) -> double {
+            return (s.contains(k) && s[k].is_number()) ? s[k].get<double>() : -1.0;
+        };
+        r.system = sstr("system");
+        r.type = "Skyhook";
+        std::string roman = sstr("planet_roman");
+        r.name = r.system + (roman.empty() ? "" : " " + roman) + " Skyhook";
+        r.sky_hourly = snum("hourly_isk");
+        r.sky_rent = snum("monthly_rent_isk");
+        r.sky_streak = (int)snum("streak");
+        r.sky_unraided = (int)snum("unraided");
+        r.sky_raided = (int)snum("raided");
+        r.sky_wstart = sstr("window_start");
+        r.sky_wend = sstr("window_end");
+        rows.push_back(std::move(r));
+    } catch (const std::exception&) {}
     std::vector<Notif> notifs;
     for (auto& e : d.value("notifications", json::array())) try {
         Notif n;
@@ -1079,6 +1108,8 @@ static bool load_or_setup(bool force_corp) {
         standalone::g_rentals_token = cfg["rentals_token"].get<std::string>();
     if (cfg.contains("rentals_corp_id") && cfg["rentals_corp_id"].is_number())
         standalone::g_rentals_corp = cfg["rentals_corp_id"].get<long long>();
+    if (cfg.contains("skyhooks_api") && cfg["skyhooks_api"].is_string())
+        standalone::g_skyhooks_api = cfg["skyhooks_api"].get<std::string>();
     if (cfg.contains("eve_logs") && cfg["eve_logs"].is_string())
         g_eve_logs_cfg = cfg["eve_logs"].get<std::string>();
     if (cfg.contains("intel_channels") && cfg["intel_channels"].is_array())
@@ -1287,6 +1318,9 @@ int main(int argc, char** argv) {
                         line += "  goo: " + std::to_string(drills) + " drills, " +
                                 std::to_string((long long)gm3) + " m3, " + isk_compact(gisk);
                 }
+                if (d.contains("skyhooks"))
+                    line += "  skyhooks: " +
+                            std::to_string(d.value("skyhooks", json::array()).size());
                 if (d.contains("error")) line += "  error: " + d.value("error", "");
                 std::printf("%s\n", line.c_str());
             }
