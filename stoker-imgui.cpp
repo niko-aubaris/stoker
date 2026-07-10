@@ -36,6 +36,8 @@ static std::map<std::string, int> g_sysid;
 struct SysPos { double nx = 0, ny = 0; int region = 0; };
 static std::map<int, SysPos> g_syspos;  // whole-universe layout (eveterm's coords)
 static std::vector<std::pair<int, int>> g_jbridges;  // friendly Ansiblex network
+struct RegionLabel { std::string name; double nx = 0, ny = 0; };
+static std::vector<RegionLabel> g_region_labels;
 
 static void load_universe() {
     if (!g_adj.empty()) return;
@@ -62,6 +64,12 @@ static void load_universe() {
     try {
         json b = json::parse(std::string(kJumpBridgesJson, kJumpBridgesSize));
         for (auto& e : b) g_jbridges.push_back({e[0].get<int>(), e[1].get<int>()});
+    } catch (...) {}
+    try {
+        json r = json::parse(std::string(kRegionLabelsJson, kRegionLabelsSize));
+        for (auto& e : r)
+            g_region_labels.push_back(
+                {e.value("name", ""), e.value("x", 0.0), e.value("y", 0.0)});
     } catch (...) {}
 }
 
@@ -841,6 +849,28 @@ int main(int argc, char** argv) {
                         (a.y > p0.y + sz.y && b.y > p0.y + sz.y))
                         continue;
                     dl->AddLine(a, b, IM_COL32(70, 74, 92, 255));
+                }
+                // big region names over the universe map, fading out as the
+                // zoom closes in (eveterm's behaviour)
+                if (mv.region == "New Eden") {
+                    int ra = (int)std::clamp(240.0f * (10.0f - mv.zoom) / 6.0f, 0.0f, 240.0f);
+                    if (ra > 2) {
+                        ImU32 rcol = IM_COL32(208, 218, 240, ra);
+                        ImFont* rfont = ImGui::GetFont();
+                        float rfs = 22.0f;
+                        for (auto& rl : g_region_labels) {
+                            MapNode fake;
+                            fake.nx = rl.nx;
+                            fake.ny = rl.ny;
+                            ImVec2 s = at(fake);
+                            if (s.x < p0.x - 200 || s.x > p0.x + sz.x + 200 || s.y < p0.y - 40 ||
+                                s.y > p0.y + sz.y + 40)
+                                continue;
+                            float tw = rfont->CalcTextSizeA(rfs, 1e30f, 0.0f, rl.name.c_str()).x;
+                            dl->AddText(rfont, rfs, ImVec2(s.x - tw * 0.5f, s.y - rfs * 0.5f),
+                                        rcol, rl.name.c_str());
+                        }
+                    }
                 }
                 // friendly Ansiblex bridges: blue arcs over the gate lines,
                 // matching eveterm's map
