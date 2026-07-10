@@ -540,7 +540,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.7.5";
+static const char* STOKER_VERSION = "v2.8.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -969,7 +969,17 @@ static void save_snap_cache(const std::vector<standalone::Snap>& snaps) {
         // stale beats vanished on the next instant boot
         std::vector<std::string> have;
         for (auto& s : snaps) {
-            j.push_back({{"label", s.label}, {"data", s.data}});
+            // skyhook rows are live-only: fetched fresh each sweep, never
+            // written to disk
+            std::string data = s.data;
+            try {
+                json d = json::parse(data);
+                if (d.contains("skyhooks")) {
+                    d.erase("skyhooks");
+                    data = d.dump();
+                }
+            } catch (...) { continue; }
+            j.push_back({{"label", s.label}, {"data", data}});
             have.push_back(s.label);
         }
         try {
@@ -1006,8 +1016,18 @@ static bool load_snap_cache() {
             g_tab_labels.clear();
             g_tab_data.clear();
             for (auto& e : j) {
+                // caches written by older versions may still carry skyhook
+                // rows; those are live-only, never painted from disk
+                std::string data = e.value("data", "");
+                try {
+                    json d = json::parse(data);
+                    if (d.contains("skyhooks")) {
+                        d.erase("skyhooks");
+                        data = d.dump();
+                    }
+                } catch (...) {}
                 g_tab_labels.push_back(e.value("label", ""));
-                g_tab_data.push_back(e.value("data", ""));
+                g_tab_data.push_back(data);
             }
             if (g_tab >= (int)g_tab_data.size()) g_tab = 0;
             if (!g_tab_data.empty()) active = g_tab_data[g_tab];

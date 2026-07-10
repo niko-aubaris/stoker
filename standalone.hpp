@@ -145,12 +145,15 @@ static const char* SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token";
 static const char* ESI = "https://esi.evetech.net/latest";
 // Requested at login: structures (the dashboard) + corp assets (the F²
 // fuel-bay column + moongoo; Director-gated in-game, others just 403 to "?")
-// + corp mining (Athanor moon-pull timers) + waypoint (set destination).
+// + corp mining (Athanor moon-pull timers) + waypoint (set destination)
+// + own roles/titles (read-only; some corp backends decide feature access
+// server-side from the presented token).
 // Overridable via config.json "scopes", e.g. to trim back to structures-only.
 static const char* SCOPE =
     "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
     "esi-industry.read_corporation_mining.v1 esi-characters.read_notifications.v1 "
-    "esi-structures.read_corporation.v1 esi-ui.write_waypoint.v1";
+    "esi-structures.read_corporation.v1 esi-ui.write_waypoint.v1 "
+    "esi-characters.read_corporation_roles.v1 esi-characters.read_titles.v1";
 
 // the new-generation ESI endpoints (skyhooks, sov hubs) only exist behind a
 // compatibility date; the legacy /latest tree does not carry them
@@ -1294,11 +1297,13 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             }
         } catch (...) { /* classification is best-effort */ }
     }
-    // the corp's watched skyhooks ride along on the same tab
+    // the corp's watched skyhooks ride along on the same tab. The character's
+    // own token goes along as the bearer; the backend decides per-character
+    // access server-side, so a non-200 here simply means no skyhook rows.
     if (corp_id == g_rentals_corp && !g_skyhooks_api.empty()) {
         try {
             int kst = 0;
-            json kj = json::parse(http_get(g_skyhooks_api, "", kst));
+            json kj = json::parse(http_get(g_skyhooks_api, tok, kst));
             if (kst == 200 && kj.contains("skyhooks") && kj["skyhooks"].is_array())
                 out["skyhooks"] = kj["skyhooks"];
         } catch (...) { /* best-effort */ }
