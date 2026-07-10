@@ -337,33 +337,9 @@ static void warn_tri(ImDrawList* dl, ImVec2 p, float s, ImU32 col, int alpha = 2
 // something on screen is flashing: run the event loop fast enough to animate
 static bool g_flash_active = false;
 
-// locally dismissed structures (destroyed/unanchored hulls the corp list
-// still carries): hidden from the table, persisted per config dir
-static std::set<long long> g_hidden;
+// fully-unanchored hulls auto-drop from the table (destroyed ones leave the
+// ESI feed by themselves); this toggle reveals the auto-dropped rows
 static bool g_show_hidden = false;
-
-static void hidden_load() {
-    try {
-        json j = standalone::load_json_file(standalone::config_dir() / "hidden.json");
-        if (j.is_array())
-            for (auto& e : j) g_hidden.insert(e.get<long long>());
-    } catch (...) {}
-}
-
-static void hidden_save() {
-    try {
-        json j = json::array();
-        for (auto v : g_hidden) j.push_back(v);
-        std::ofstream f(standalone::config_dir() / "hidden.json",
-                        std::ios::binary | std::ios::trunc);
-        f << j.dump();
-    } catch (...) {}
-}
-
-static void hidden_toggle(long long sid) {
-    if (!g_hidden.erase(sid)) g_hidden.insert(sid);
-    hidden_save();
-}
 
 // countdown text: "1d 04:22:11" or "04:22:11"
 static std::string fmt_dur(double secs) {
@@ -377,11 +353,17 @@ static std::string fmt_dur(double secs) {
     return b;
 }
 
-// reinforcement clock: counts down toward the vulnerability window, so the
-// colour runs yellow -> red as it approaches zero. NONE when no timer.
+// structure clock: reinforcement / anchoring vulnerability timers come from
+// state_timer_end, an unanchor-in-progress from unanchors_at. Counts down
+// toward the dangerous moment, so the colour runs yellow -> red. NONE when
+// nothing is ticking.
 static void timer_info(const Row& r, std::string& txt, ImU32& col) {
     time_t nowt = time(nullptr);
     time_t te = r.state_timer_end.empty() ? 0 : parse_iso(r.state_timer_end);
+    if (te <= nowt) {
+        time_t ua = r.unanchors_at.empty() ? 0 : parse_iso(r.unanchors_at);
+        if (ua > nowt) te = ua;  // the unanchor completion clock
+    }
     if (te <= nowt) {
         txt = "NONE";
         col = IM_COL32(128, 136, 150, 255);
@@ -682,7 +664,6 @@ int main(int argc, char** argv) {
     st.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.00f, 0.70f, 0.78f, 1);
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 130");
-    hidden_load();
     for (auto& e : kStructIcons)
         g_type_icons[e.type] = make_icon(e.rgba, kStructIconSize, true);
     g_ic_fuel = make_icon(kIcon_fuel);
@@ -1055,10 +1036,13 @@ int main(int argc, char** argv) {
         // filter
         ImGui::SetNextItemWidth(260);
         ImGui::InputTextWithHint("##filter", "filter name/system/type", filter, sizeof filter);
-        if (!g_hidden.empty()) {
+        int suppressed = 0;
+        for (auto& r : rows)
+            if (r.state == "unanchored") suppressed++;
+        if (suppressed) {
             ImGui::SameLine();
             char hl[48];
-            std::snprintf(hl, sizeof hl, "show hidden (%d)", (int)g_hidden.size());
+            std::snprintf(hl, sizeof hl, "show hidden (%d)", suppressed);
             ImGui::Checkbox(hl, &g_show_hidden);
         }
         int rented = 0;
@@ -1091,7 +1075,9 @@ int main(int argc, char** argv) {
         for (auto& c : f) c = (char)tolower((unsigned char)c);
         std::vector<const Row*> view;
         for (auto& r : rows) {
-            if (!g_show_hidden && g_hidden.count(r.sid)) continue;
+            // automated removal: fully-unanchored hulls drop out on their own
+            // (destroyed ones leave the ESI feed by themselves)
+            if (!g_show_hidden && r.state == "unanchored") continue;
             if (rentals_online && g_corp_only && r.rental == "private") continue;
             if (!g_type_tab.empty() && r.type != g_type_tab) continue;
             if (!f.empty()) {
@@ -1185,8 +1171,8 @@ int main(int argc, char** argv) {
                         ImDrawList* dls = ImGui::GetWindowDrawList();
                         ImVec2 wp = ImGui::GetCursorScreenPos();
                         float fs2 = std::min(ImGui::GetTextLineHeight() - 3.0f, 13.0f);
-                        warn_tri(dls, ImVec2(wp.x, wp.y + 2), fs2, fcol);
-                        dls->AddText(ImGui::GetFont(), fs2, ImVec2(wp.x + fs2 + 3, wp.y + 1),
+                        warn_tri(dls, ImVec2(wp.x - 5, wp.y + 2), fs2, fcol);
+                        dls->AddText(ImGui::GetFont(), fs2, ImVec2(wp.x - 5 + fs2 + 2, wp.y + 1),
                                      fcol, ftxt);
                     }
                 }
@@ -1200,12 +1186,6 @@ int main(int argc, char** argv) {
                                       ImVec2(0, rowh))) {
                     detail_sid = r.sid;
                     view_tab = 0;
-                }
-                if (ImGui::BeginPopupContextItem()) {  // right-click: dismiss
-                    bool hid = g_hidden.count(r.sid) > 0;
-                    if (ImGui::MenuItem(hid ? "unhide" : "remove from list"))
-                        hidden_toggle(r.sid);
-                    ImGui::EndPopup();
                 }
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
@@ -1444,10 +1424,6 @@ int main(int argc, char** argv) {
                         auto sit = g_sysid.find(ls);
                         if (sit != g_sysid.end() && ImGui::Button("set destination"))
                             act_set_destination(sit->second, d->system);
-                        ImGui::SameLine();
-                        bool hid = g_hidden.count(d->sid) > 0;
-                        if (ImGui::Button(hid ? "unhide" : "remove from list"))
-                            hidden_toggle(d->sid);
                     }
                     if (!g_standalone) {
                         ImGui::Separator();
