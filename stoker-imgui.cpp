@@ -349,6 +349,26 @@ static std::string to30(const std::string& s) {
     return (s.empty() || s == "ok" || s == "--" || s == "?") ? s : s + " to 30d";
 }
 
+// flame tongues licking up from a bar that has been full too long.
+// intensity 0..1 scales height, glow and flicker; classic fire colours
+// (red-orange tongues, yellow cores), per-x hash jitter so it looks alive.
+static void draw_fire(ImDrawList* dl, ImVec2 p, float w, float intensity, unsigned seed) {
+    if (intensity <= 0) return;
+    double t = ImGui::GetTime();
+    for (float x = 5; x < w - 5; x += 7) {
+        unsigned hsh = seed * 2654435761u + (unsigned)(x * 97.0f);
+        float ph = (hsh % 628) / 100.0f;
+        float fl = 0.55f + 0.45f * (float)std::sin(t * (4.5 + (hsh % 5) * 0.8) + ph);
+        float fh = (3.0f + 12.0f * intensity) * fl;
+        float bx = p.x + x, by = p.y + 1;
+        int a = (int)(140 + 115 * intensity);
+        dl->AddTriangleFilled(ImVec2(bx - 3, by), ImVec2(bx + 3, by), ImVec2(bx, by - fh),
+                              IM_COL32(255, 96, 26, a));
+        dl->AddTriangleFilled(ImVec2(bx - 1.5f, by), ImVec2(bx + 1.5f, by),
+                              ImVec2(bx, by - fh * 0.55f), IM_COL32(255, 214, 90, a));
+    }
+}
+
 // cell height: one strip per meter (fuel / gas-oz / moongoo) with 2px gaps
 static float gauge_cell_h(int meters) {
     float h = ((ImGui::GetTextLineHeight() + 6) * 2 - 2) / 2;
@@ -493,14 +513,21 @@ static void dual_gauge(const Row& r, float w) {
         } else {
             mini_bar(dl, p, w, h, -1, "NA", "", false, 0);
         }
-        if (r.sky_bays && r.sky_sec_m3 >= 0) {
-            char sc[32];
-            std::snprintf(sc, sizeof sc, "%.0f%%", 100.0 * r.sky_sec_m3 / SKY_RESERVE_M3);
-            mini_bar(dl, p2, w, h, r.sky_sec_m3 / SKY_RESERVE_M3, sc,
-                     isk_compact(r.sky_sec_isk < 0 ? 0 : r.sky_sec_isk) + " isk", true,
-                     g_ic_gas);
-        } else {  // reserve hold is the sov holder's, invisible to renters
-            mini_bar(dl, p2, w, h, -1, "NA", "", true, 0);
+        // second strip: the unraided-streak meter. 0..10 runs green (fresh)
+        // to red (full); past 10 the bar catches fire, worsening to 20.
+        if (r.sky_streak >= 0) {
+            double f = std::min(1.0, r.sky_streak / 10.0);
+            char sl[32];
+            std::snprintf(sl, sizeof sl, "unraided x%d", r.sky_streak);
+            mini_bar(dl, p2, w, h, f, sl, "", false, 0, true);
+            if (r.sky_streak > 10) {
+                draw_fire(dl, p2, w,
+                          (float)std::min(1.0, (r.sky_streak - 10) / 10.0),
+                          (unsigned)r.sid);
+                g_flash_active = true;  // keep the flames animating
+            }
+        } else {
+            mini_bar(dl, p2, w, h, -1, "?", "", false, 0);
         }
         mini_bar(dl, p3, w, h, -1, "NA", "", false, 0);
         ImGui::Dummy(ImVec2(w, gauge_cell_h(3)));
@@ -1429,7 +1456,7 @@ int main(int argc, char** argv) {
                         std::string inc = r.sky_hourly >= 0 ? commas(r.sky_hourly) + "/h" : "?";
                         dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
                                      IM_COL32(200, 206, 222, 255), inc.c_str());
-                        if (open_) {
+                        if (open_) {  // the streak meter carries the count now
                             g_flash_active = true;
                             int wa = (int)(90 +
                                            165 * (0.5 + 0.5 * std::sin(ImGui::GetTime() * 6.0)));
@@ -1437,11 +1464,6 @@ int main(int argc, char** argv) {
                                      IM_COL32(255, 70, 70, 255), wa);
                             dl2->AddText(fnt, fs, ImVec2(tx + fs + 4, y0 + 2 * sp),
                                          IM_COL32(255, 70, 70, wa), "RAIDABLE");
-                        } else if (r.sky_streak >= 0) {
-                            char st[48];
-                            std::snprintf(st, sizeof st, "unraided x%d", r.sky_streak);
-                            dl2->AddText(fnt, fs, ImVec2(tx, y0 + 2 * sp),
-                                         IM_COL32(128, 136, 150, 255), st);
                         }
                     } else {
                     {
