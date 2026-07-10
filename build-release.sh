@@ -22,6 +22,7 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw64.cmake "${EXTRA[
 cmake --build build-win -j"$(nproc)"
 
 mkdir -p dist
+rm -f dist/stoker-linux-x86_64.tar.gz dist/stoker-windows-x64.zip  # zip APPENDS to existing archives
 tar -C build-linux -czf dist/stoker-linux-x86_64.tar.gz stoker-gui
 ( cd build-win && zip -q9 ../dist/stoker-windows-x64.zip stoker-gui.exe )
 ls -lh dist/
