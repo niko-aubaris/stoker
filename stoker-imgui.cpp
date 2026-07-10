@@ -1569,8 +1569,8 @@ int main(int argc, char** argv) {
                                                    isk_compact(d->sky_unsec_isk).c_str());
                                 if (d->sky_est)
                                     ImGui::TextColored(GREY_,
-                                                       "estimated: half of production since "
-                                                       "last raid (%s)",
+                                                       "estimated: gross accrual since last "
+                                                       "raid (%s), capped at one 72h raid cycle",
                                                        d->sky_last_raided.empty()
                                                            ? "tracking start"
                                                            : rel_age(d->sky_last_raided).c_str());
