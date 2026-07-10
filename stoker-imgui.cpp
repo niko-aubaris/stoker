@@ -1121,41 +1121,52 @@ int main(int argc, char** argv) {
                 }
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
+                ImFont* fnt = ImGui::GetFont();
                 dl2->AddText(cp, ImGui::ColorConvertFloat4ToU32(TEXTC), r.name.c_str());
-                {   // Timer under the name; Moon Pull below it so nothing
-                    // pushes it around
-                    ImVec2 tp(cp.x + 2, cp.y + lh + 5);
-                    dl2->AddText(tp, IM_COL32(128, 136, 150, 255), "Timer:");
-                    std::string tt;
-                    ImU32 tc;
-                    timer_info(r, tt, tc);
-                    dl2->AddText(ImVec2(tp.x + ImGui::CalcTextSize("Timer:").x + 6, tp.y), tc,
-                                 tt.c_str());
-                }
-                if (r.type == "Athanor" || r.type == "Tatara") {
-                    ImVec2 mp2(cp.x + 2, cp.y + 2 * (lh + 5));
-                    dl2->AddText(mp2, IM_COL32(128, 136, 150, 255), "Moon Pull:");
-                    std::string mt;
-                    ImU32 mc;
-                    moonpull_info(r, extractions_ok, mt, mc);
-                    dl2->AddText(ImVec2(mp2.x + ImGui::CalcTextSize("Moon Pull:").x + 6, mp2.y),
-                                 mc, mt.c_str());
-                }
-                {   // layer checklist stacked on the right edge of the cell:
-                    // green dot = layer intact, red = stripped
+                // under the name: the layer checklist (green = intact, red =
+                // stripped), with Timer and Moon Pull in a column next to it
+                {
+                    float fs = std::min(lh - 2.0f, 15.0f);  // compact sub-rows
+                    float y0 = cp.y + lh + 3, sp = fs + 3;
                     int layers = 3;
                     if (r.state == "armor_reinforce" || r.state == "armor_vulnerable")
                         layers = 2;
                     else if (r.state == "hull_reinforce" || r.state == "hull_vulnerable")
                         layers = 1;
                     const char* lbl[3] = {"Shield", "Armour", "Hull"};
-                    float bx = cp.x + cw - 78;
                     for (int li = 0; li < 3; li++) {
-                        float y = cp.y + 1 + li * (lh + 4);
-                        dl2->AddCircleFilled(ImVec2(bx + 4, y + lh * 0.55f), 3.5f,
+                        float y = y0 + li * sp;
+                        dl2->AddCircleFilled(ImVec2(cp.x + 6, y + fs * 0.55f), 3.0f,
                                              layers >= 3 - li ? IM_COL32(80, 230, 110, 255)
                                                               : IM_COL32(255, 70, 70, 255));
-                        dl2->AddText(ImVec2(bx + 12, y), IM_COL32(200, 206, 222, 255), lbl[li]);
+                        dl2->AddText(fnt, fs, ImVec2(cp.x + 13, y),
+                                     IM_COL32(200, 206, 222, 255), lbl[li]);
+                    }
+                    float tx = cp.x + 13 + fnt->CalcTextSizeA(fs, 1e30f, 0, "Armour").x + 18;
+                    (void)cw;
+                    {
+                        dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
+                                     "Timer:");
+                        std::string tt;
+                        ImU32 tc;
+                        timer_info(r, tt, tc);
+                        dl2->AddText(fnt, fs,
+                                     ImVec2(tx + fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x +
+                                                6,
+                                            y0),
+                                     tc, tt.c_str());
+                    }
+                    if (r.type == "Athanor" || r.type == "Tatara") {
+                        dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
+                                     "Moon Pull:");
+                        std::string mt;
+                        ImU32 mc;
+                        moonpull_info(r, extractions_ok, mt, mc);
+                        dl2->AddText(fnt, fs,
+                                     ImVec2(tx + fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x +
+                                                6,
+                                            y0 + sp),
+                                     mc, mt.c_str());
                     }
                 }
             }
