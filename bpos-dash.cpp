@@ -461,7 +461,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.4.4";
+static const char* STOKER_VERSION = "v2.4.5";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -584,9 +584,13 @@ static std::string rel_age(const std::string& iso) {
     long secs = (long)(time(nullptr) - t);
     if (secs < 0) secs = 0;
     if (secs < 90) return std::to_string(secs) + "s ago";
-    if (secs < 5400) return std::to_string(secs / 60) + "m ago";
-    if (secs < 172800) return std::to_string(secs / 3600) + "h ago";
-    return std::to_string(secs / 86400) + "d ago";
+    if (secs < 3600) return std::to_string(secs / 60) + "m ago";
+    if (secs < 86400) {
+        long h = secs / 3600, m = (secs % 3600) / 60;
+        return std::to_string(h) + "h" + (m ? std::to_string(m) + "m" : "") + " ago";
+    }
+    long d = secs / 86400, h = (secs % 86400) / 3600;
+    return std::to_string(d) + "d" + (h ? std::to_string(h) + "h" : "") + " ago";
 }
 
 // --- intro splash: fuel blocks off the shovel, reactor lights up ------------
