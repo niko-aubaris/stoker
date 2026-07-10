@@ -1376,11 +1376,11 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     }
 
     // Rented (alliance-owned) skyhooks expose no bay contents to us, so
-    // estimate the raidable surplus: gross accrual (no tax/split deductions)
-    // at the watchlist income rate since the last raid. Raids run roughly
-    // every 3 days, so the clock never accrues past one 72h cycle even when
-    // the tracker missed the raid. Income figures are thousands of ISK per
-    // hour; m3 derives via the magmatic gas market price. Marked "~".
+    // estimate the raidable surplus from the tracker's unraided STREAK: each
+    // consecutive unraided window is one ~72h cycle of gross accrual at the
+    // watchlist income rate (streak 0 = just raided = empty). Income figures
+    // are thousands of ISK per hour; m3 derives via the magmatic gas market
+    // price. Marked "~".
     if (out.contains("skyhooks"))
         for (auto& row : out["skyhooks"]) {
             if (row.value("bays_ok", false)) continue;
@@ -1388,13 +1388,11 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                                 ? row["hourly_isk"].get<double>()
                                 : -1;
             if (hourly <= 0) continue;
-            std::string lr = row.value("last_raided_at", "");
-            if (lr.empty()) lr = row.value("tracked_since", "");
-            time_t floor_t = lr.empty() ? 0 : parse_iso(lr);
-            if (!floor_t) continue;
-            double hours = std::max(0.0, difftime(time(nullptr), floor_t) / 3600.0);
-            hours = std::min(hours, 72.0);  // one raid cycle
-            double isk = hourly * 1000.0 * hours;
+            double streak = row.contains("streak") && row["streak"].is_number()
+                                ? row["streak"].get<double>()
+                                : -1;
+            if (streak < 0) continue;
+            double isk = hourly * 1000.0 * 72.0 * streak;
             row["unsec_isk"] = isk;
             {
                 std::lock_guard<std::mutex> vl(s_val_mtx);

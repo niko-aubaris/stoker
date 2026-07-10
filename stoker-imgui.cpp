@@ -1569,11 +1569,9 @@ int main(int argc, char** argv) {
                                                    isk_compact(d->sky_unsec_isk).c_str());
                                 if (d->sky_est)
                                     ImGui::TextColored(GREY_,
-                                                       "estimated: gross accrual since last "
-                                                       "raid (%s), capped at one 72h raid cycle",
-                                                       d->sky_last_raided.empty()
-                                                           ? "tracking start"
-                                                           : rel_age(d->sky_last_raided).c_str());
+                                                       "estimated: income rate x 72h x "
+                                                       "unraided streak (x%d)",
+                                                       d->sky_streak < 0 ? 0 : d->sky_streak);
                             }
                             if (d->sky_bays && d->sky_sec_m3 >= 0) {
                                 ImGui::TextColored(GREY_, "Reserve hold:");
