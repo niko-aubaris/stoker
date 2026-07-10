@@ -1110,6 +1110,7 @@ int main(int argc, char** argv) {
                 }
                 ImGui::TableSetColumnIndex(2);
                 float rowh = gauge_cell_h(3);  // uniform: every row Metenox-sized
+                float cw = ImGui::GetContentRegionAvail().x;
                 ImVec2 cp = ImGui::GetCursorScreenPos();
                 if (ImGui::Selectable(("##row" + std::to_string(r.sid)).c_str(),
                                       r.sid == detail_sid,
@@ -1121,39 +1122,41 @@ int main(int argc, char** argv) {
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
                 dl2->AddText(cp, ImGui::ColorConvertFloat4ToU32(TEXTC), r.name.c_str());
-                {   // layer dots (green = layer intact, red = stripped) + timer
+                {   // Timer under the name; Moon Pull below it so nothing
+                    // pushes it around
+                    ImVec2 tp(cp.x + 2, cp.y + lh + 5);
+                    dl2->AddText(tp, IM_COL32(128, 136, 150, 255), "Timer:");
+                    std::string tt;
+                    ImU32 tc;
+                    timer_info(r, tt, tc);
+                    dl2->AddText(ImVec2(tp.x + ImGui::CalcTextSize("Timer:").x + 6, tp.y), tc,
+                                 tt.c_str());
+                }
+                if (r.type == "Athanor" || r.type == "Tatara") {
+                    ImVec2 mp2(cp.x + 2, cp.y + 2 * (lh + 5));
+                    dl2->AddText(mp2, IM_COL32(128, 136, 150, 255), "Moon Pull:");
+                    std::string mt;
+                    ImU32 mc;
+                    moonpull_info(r, extractions_ok, mt, mc);
+                    dl2->AddText(ImVec2(mp2.x + ImGui::CalcTextSize("Moon Pull:").x + 6, mp2.y),
+                                 mc, mt.c_str());
+                }
+                {   // layer checklist stacked on the right edge of the cell:
+                    // green dot = layer intact, red = stripped
                     int layers = 3;
                     if (r.state == "armor_reinforce" || r.state == "armor_vulnerable")
                         layers = 2;
                     else if (r.state == "hull_reinforce" || r.state == "hull_vulnerable")
                         layers = 1;
-                    ImVec2 sp(cp.x + 2, cp.y + lh + 5);
-                    const char* lbl[3] = {"S", "A", "H"};
-                    float x = sp.x;
+                    const char* lbl[3] = {"Shield", "Armour", "Hull"};
+                    float bx = cp.x + cw - 78;
                     for (int li = 0; li < 3; li++) {
-                        dl2->AddCircleFilled(ImVec2(x + 3, sp.y + lh * 0.55f), 3.5f,
+                        float y = cp.y + 1 + li * (lh + 4);
+                        dl2->AddCircleFilled(ImVec2(bx + 4, y + lh * 0.55f), 3.5f,
                                              layers >= 3 - li ? IM_COL32(80, 230, 110, 255)
                                                               : IM_COL32(255, 70, 70, 255));
-                        dl2->AddText(ImVec2(x + 9, sp.y), IM_COL32(200, 206, 222, 255),
-                                     lbl[li]);
-                        x += 26;
+                        dl2->AddText(ImVec2(bx + 12, y), IM_COL32(200, 206, 222, 255), lbl[li]);
                     }
-                    x += 6;
-                    dl2->AddText(ImVec2(x, sp.y), IM_COL32(128, 136, 150, 255), "Timer:");
-                    x += ImGui::CalcTextSize("Timer:").x + 6;
-                    std::string tt;
-                    ImU32 tc;
-                    timer_info(r, tt, tc);
-                    dl2->AddText(ImVec2(x, sp.y), tc, tt.c_str());
-                }
-                if (r.type == "Athanor" || r.type == "Tatara") {
-                    ImVec2 mp2(cp.x + 2, cp.y + 2 * (lh + 5));
-                    dl2->AddText(mp2, IM_COL32(128, 136, 150, 255), "Moon Pull:");
-                    float x = mp2.x + ImGui::CalcTextSize("Moon Pull:").x + 6;
-                    std::string mt;
-                    ImU32 mc;
-                    moonpull_info(r, extractions_ok, mt, mc);
-                    dl2->AddText(ImVec2(x, mp2.y), mc, mt.c_str());
                 }
             }
             ImGui::EndTable();
