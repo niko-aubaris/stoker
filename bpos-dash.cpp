@@ -211,13 +211,57 @@ static void spawn_bg(F&& fn) {
 }
 
 // --- helpers ----------------------------------------------------------------
+#ifdef _WIN32
+// _popen from a -mwindows GUI app pops a visible console window for every
+// child, so each curl call flashed a terminal on screen. Spawn through
+// CreateProcess with CREATE_NO_WINDOW and read stdout over a pipe instead;
+// "cmd /C" keeps _popen's shell semantics (quoting, 2>NUL, redirects), and
+// stderr goes to NUL like the old invisible console unless the command
+// redirects it itself. The spawn section is mutexed so concurrent fetch
+// threads can't leak each other's inheritable pipe ends into their children
+// (a leaked write end would hold the pipe open and hang the read forever).
 static std::string run_cmd(const char* cmd) {
     std::string out;
-#ifdef _WIN32
-    FILE* p = popen(cmd, "rb");  // text mode would eat the \r in HTTP headers
+    static std::mutex spawn_mtx;
+    HANDLE rd = nullptr;
+    PROCESS_INFORMATION pi{};
+    {
+        std::lock_guard<std::mutex> lk(spawn_mtx);
+        SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+        HANDLE wr = nullptr;
+        if (!CreatePipe(&rd, &wr, &sa, 0)) return out;
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        HANDLE nul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
+                                 OPEN_EXISTING, 0, nullptr);
+        STARTUPINFOA si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdError = nul;
+        si.hStdInput = nullptr;
+        std::string cl = std::string("cmd /C \"") + cmd + "\"";
+        BOOL ok = CreateProcessA(nullptr, cl.data(), nullptr, nullptr, TRUE,
+                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        CloseHandle(wr);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        if (!ok) {
+            CloseHandle(rd);
+            return out;
+        }
+    }
+    char buf[8192];
+    DWORD n = 0;
+    while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return out;
+}
 #else
+static std::string run_cmd(const char* cmd) {
+    std::string out;
     FILE* p = popen(cmd, "r");
-#endif
     if (!p) return out;
     char buf[8192];
     size_t n;
@@ -225,6 +269,7 @@ static std::string run_cmd(const char* cmd) {
     pclose(p);
     return out;
 }
+#endif
 
 static std::string urlenc(const std::string& s) {
     static const char* hex = "0123456789ABCDEF";
@@ -472,7 +517,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.5.0";
+static const char* STOKER_VERSION = "v2.5.1";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
