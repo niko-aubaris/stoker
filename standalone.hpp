@@ -1115,13 +1115,22 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             }
         }
         std::string svc;
+        int sv_on = 0, sv_off = 0;
         if (s.contains("services") && s["services"].is_array())
             for (auto& v : s["services"]) {
-                if (v.value("state", "") != "online") continue;
+                if (v.value("state", "") != "online") {
+                    sv_off++;
+                    continue;
+                }
+                sv_on++;
                 if (!svc.empty()) svc += ", ";
                 svc += v.value("name", "");
             }
         r["services"] = svc;
+        r["services_online"] = sv_on;
+        r["services_offline"] = sv_off;
+        if (s.contains("unanchors_at") && s["unanchors_at"].is_string())
+            r["unanchors_at"] = s["unanchors_at"];
         std::string fe = s.value("fuel_expires", "");
         r["fuel_expires"] = fe;
         double days = -1;

@@ -110,6 +110,8 @@ struct Row {
     std::vector<GooItem> goo;         // bay contents by value, priced at market avg
     std::string state_timer_start, state_timer_end;  // reinforcement clock (ISO)
     std::string extraction_start, chunk_arrival;     // Athanor/Tatara moon pull (ISO)
+    std::string unanchors_at;         // set while unanchoring (ISO)
+    int sv_on = -1, sv_off = -1;      // service counts; -1 = feed doesn't say
     std::vector<RefuelEvent> log;     // this structure's last refuel events
 };
 
@@ -459,7 +461,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.4.1";
+static const char* STOKER_VERSION = "v2.4.2";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -693,6 +695,11 @@ static void ingest(const std::string& raw) {
         r.state = s.value("state", "");
         r.state_timer_start = s.value("state_timer_start", "");
         r.state_timer_end = s.value("state_timer_end", "");
+        r.unanchors_at = s.value("unanchors_at", "");
+        if (s.contains("services_online") && !s["services_online"].is_null())
+            r.sv_on = s["services_online"].get<int>();
+        if (s.contains("services_offline") && !s["services_offline"].is_null())
+            r.sv_off = s["services_offline"].get<int>();
         r.extraction_start = s.value("extraction_start", "");
         r.chunk_arrival = s.value("chunk_arrival", "");
         r.services = s.value("services", "");

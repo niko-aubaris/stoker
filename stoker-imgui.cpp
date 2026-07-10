@@ -17,6 +17,7 @@
 #include "jumpmap_data.hpp"
 #include "universe_pos.hpp"
 #include <regex>
+#include <set>
 
 // --- the map (same layout as eveterm: DOTLAN region SVG positions + the
 // embedded New Eden gate graph) -------------------------------------------------
@@ -320,6 +321,48 @@ static std::string to30(const std::string& s) {
 static float gauge_cell_h(int meters) {
     float h = ((ImGui::GetTextLineHeight() + 6) * 2 - 2) / 2;
     return meters * h + (meters - 1) * 2;
+}
+
+// little warning triangle with an exclamation mark, chart-style
+static void warn_tri(ImDrawList* dl, ImVec2 p, float s, ImU32 col, int alpha = 255) {
+    ImU32 c = (col & 0xFFFFFF) | ((ImU32)alpha << 24);
+    dl->AddTriangleFilled(ImVec2(p.x + s * 0.5f, p.y), ImVec2(p.x, p.y + s),
+                          ImVec2(p.x + s, p.y + s), c);
+    ImU32 dark = IM_COL32(20, 20, 26, alpha);
+    dl->AddLine(ImVec2(p.x + s * 0.5f, p.y + s * 0.34f),
+                ImVec2(p.x + s * 0.5f, p.y + s * 0.66f), dark, 1.8f);
+    dl->AddCircleFilled(ImVec2(p.x + s * 0.5f, p.y + s * 0.82f), 1.1f, dark);
+}
+
+// something on screen is flashing: run the event loop fast enough to animate
+static bool g_flash_active = false;
+
+// locally dismissed structures (destroyed/unanchored hulls the corp list
+// still carries): hidden from the table, persisted per config dir
+static std::set<long long> g_hidden;
+static bool g_show_hidden = false;
+
+static void hidden_load() {
+    try {
+        json j = standalone::load_json_file(standalone::config_dir() / "hidden.json");
+        if (j.is_array())
+            for (auto& e : j) g_hidden.insert(e.get<long long>());
+    } catch (...) {}
+}
+
+static void hidden_save() {
+    try {
+        json j = json::array();
+        for (auto v : g_hidden) j.push_back(v);
+        std::ofstream f(standalone::config_dir() / "hidden.json",
+                        std::ios::binary | std::ios::trunc);
+        f << j.dump();
+    } catch (...) {}
+}
+
+static void hidden_toggle(long long sid) {
+    if (!g_hidden.erase(sid)) g_hidden.insert(sid);
+    hidden_save();
 }
 
 // countdown text: "1d 04:22:11" or "04:22:11"
@@ -639,6 +682,7 @@ int main(int argc, char** argv) {
     st.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.00f, 0.70f, 0.78f, 1);
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 130");
+    hidden_load();
     for (auto& e : kStructIcons)
         g_type_icons[e.type] = make_icon(e.rgba, kStructIconSize, true);
     g_ic_fuel = make_icon(kIcon_fuel);
@@ -657,7 +701,7 @@ int main(int argc, char** argv) {
     int view_tab = 0;  // 0 detail, 1 refuel log
 
     while (!glfwWindowShouldClose(win) && g_run) {
-        glfwWaitEventsTimeout(0.25);
+        glfwWaitEventsTimeout(g_flash_active ? 0.06 : 0.25);
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -755,6 +799,7 @@ int main(int argc, char** argv) {
         ImGui::SameLine();
 
         eve_logs_scan();  // pilot position + intel from the client's chat logs
+        g_flash_active = false;  // re-armed by any warning drawn this frame
 
         if (mode == 1) {
             static char region[64] = {0};
@@ -1010,6 +1055,12 @@ int main(int argc, char** argv) {
         // filter
         ImGui::SetNextItemWidth(260);
         ImGui::InputTextWithHint("##filter", "filter name/system/type", filter, sizeof filter);
+        if (!g_hidden.empty()) {
+            ImGui::SameLine();
+            char hl[48];
+            std::snprintf(hl, sizeof hl, "show hidden (%d)", (int)g_hidden.size());
+            ImGui::Checkbox(hl, &g_show_hidden);
+        }
         int rented = 0;
         if (rentals_online) {
             for (auto& r : rows)
@@ -1040,6 +1091,7 @@ int main(int argc, char** argv) {
         for (auto& c : f) c = (char)tolower((unsigned char)c);
         std::vector<const Row*> view;
         for (auto& r : rows) {
+            if (!g_show_hidden && g_hidden.count(r.sid)) continue;
             if (rentals_online && g_corp_only && r.rental == "private") continue;
             if (!g_type_tab.empty() && r.type != g_type_tab) continue;
             if (!f.empty()) {
@@ -1111,6 +1163,32 @@ int main(int argc, char** argv) {
                         }
                     ImGui::TextColored(hot ? ImVec4(1, 0.27f, 0.27f, 1) : CYAN_, "%s",
                                        r.system.c_str());
+                    // power state under the system name, derived the way the
+                    // game derives it: fuel gone = Low Power, 7+ days without
+                    // fuel = Abandoned; all services off while fueled = Offline
+                    const char* ftxt = nullptr;
+                    ImU32 fcol = 0;
+                    if (r.has_fuel && r.days <= -7) {
+                        ftxt = "ABANDONED";
+                        fcol = IM_COL32(255, 70, 70, 255);
+                    } else if (!r.has_fuel || r.days <= 0) {
+                        ftxt = "LOW POWER";
+                        fcol = IM_COL32(255, 140, 0, 255);
+                    } else if (r.sv_on == 0 && r.sv_off > 0) {
+                        ftxt = "OFFLINE";
+                        fcol = IM_COL32(128, 136, 150, 255);
+                    } else if (r.days < 7) {
+                        ftxt = "LOW FUEL";
+                        fcol = IM_COL32(250, 215, 70, 255);
+                    }
+                    if (ftxt) {
+                        ImDrawList* dls = ImGui::GetWindowDrawList();
+                        ImVec2 wp = ImGui::GetCursorScreenPos();
+                        float fs2 = std::min(ImGui::GetTextLineHeight() - 3.0f, 13.0f);
+                        warn_tri(dls, ImVec2(wp.x, wp.y + 2), fs2, fcol);
+                        dls->AddText(ImGui::GetFont(), fs2, ImVec2(wp.x + fs2 + 3, wp.y + 1),
+                                     fcol, ftxt);
+                    }
                 }
                 ImGui::TableSetColumnIndex(2);
                 float rowh = gauge_cell_h(3);  // uniform: every row Metenox-sized
@@ -1122,6 +1200,12 @@ int main(int argc, char** argv) {
                                       ImVec2(0, rowh))) {
                     detail_sid = r.sid;
                     view_tab = 0;
+                }
+                if (ImGui::BeginPopupContextItem()) {  // right-click: dismiss
+                    bool hid = g_hidden.count(r.sid) > 0;
+                    if (ImGui::MenuItem(hid ? "unhide" : "remove from list"))
+                        hidden_toggle(r.sid);
+                    ImGui::EndPopup();
                 }
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
@@ -1184,6 +1268,41 @@ int main(int argc, char** argv) {
                                                 6,
                                             y0 + sp),
                                      mc, mt.c_str());
+                    }
+                    // state warning under Moon Pull: no label, blank when calm,
+                    // flashing triangle + text when something is happening.
+                    // Mapped from the ESI state enum + unanchors_at.
+                    {
+                        const char* wtxt = nullptr;
+                        ImU32 wcol = 0;
+                        time_t ua = r.unanchors_at.empty() ? 0 : parse_iso(r.unanchors_at);
+                        if (r.state == "armor_reinforce" || r.state == "hull_reinforce" ||
+                            r.state == "armor_vulnerable" || r.state == "hull_vulnerable") {
+                            wtxt = "UNDER ATTACK";
+                            wcol = IM_COL32(255, 70, 70, 255);
+                        } else if (r.state == "unanchored") {
+                            wtxt = "UNANCHORED";
+                            wcol = IM_COL32(250, 215, 70, 255);
+                        } else if (ua > time(nullptr)) {
+                            wtxt = "UNANCHORING";
+                            wcol = IM_COL32(250, 215, 70, 255);
+                        } else if (r.state == "onlining_vulnerable") {
+                            wtxt = "ONLINING...";
+                            wcol = IM_COL32(250, 215, 70, 255);
+                        } else if (r.state == "anchoring" || r.state == "anchor_vulnerable" ||
+                                   r.state == "deploy_vulnerable" ||
+                                   r.state == "fitting_invulnerable") {
+                            wtxt = "ANCHORING";
+                            wcol = IM_COL32(250, 215, 70, 255);
+                        }
+                        if (wtxt) {
+                            g_flash_active = true;
+                            int wa = (int)(90 +
+                                           165 * (0.5 + 0.5 * std::sin(ImGui::GetTime() * 6.0)));
+                            warn_tri(dl2, ImVec2(tx, y0 + 2 * sp + 1), fs - 2, wcol, wa);
+                            dl2->AddText(fnt, fs, ImVec2(tx + fs + 4, y0 + 2 * sp),
+                                         (wcol & 0xFFFFFF) | ((ImU32)wa << 24), wtxt);
+                        }
                     }
                 }
             }
@@ -1325,6 +1444,10 @@ int main(int argc, char** argv) {
                         auto sit = g_sysid.find(ls);
                         if (sit != g_sysid.end() && ImGui::Button("set destination"))
                             act_set_destination(sit->second, d->system);
+                        ImGui::SameLine();
+                        bool hid = g_hidden.count(d->sid) > 0;
+                        if (ImGui::Button(hid ? "unhide" : "remove from list"))
+                            hidden_toggle(d->sid);
                     }
                     if (!g_standalone) {
                         ImGui::Separator();
