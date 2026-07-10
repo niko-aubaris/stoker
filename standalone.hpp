@@ -1375,6 +1375,34 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         } catch (...) { /* bays are best-effort; the watch feed still renders */ }
     }
 
+    // Rented (alliance-owned) skyhooks expose no bay contents to us, so
+    // estimate the raidable surplus: it accrues half of production since the
+    // last raid the tracker saw (fallback: since tracking began). Income
+    // figures are in thousands of ISK per hour; m3 derives via the magmatic
+    // gas market price. Clearly marked as an estimate downstream.
+    if (out.contains("skyhooks"))
+        for (auto& row : out["skyhooks"]) {
+            if (row.value("bays_ok", false)) continue;
+            double hourly = row.contains("hourly_isk") && row["hourly_isk"].is_number()
+                                ? row["hourly_isk"].get<double>()
+                                : -1;
+            if (hourly <= 0) continue;
+            std::string lr = row.value("last_raided_at", "");
+            if (lr.empty()) lr = row.value("tracked_since", "");
+            time_t floor_t = lr.empty() ? 0 : parse_iso(lr);
+            if (!floor_t) continue;
+            double hours = std::max(0.0, difftime(time(nullptr), floor_t) / 3600.0);
+            double isk = hourly * 1000.0 * hours * 0.5;
+            row["unsec_isk"] = isk;
+            {
+                std::lock_guard<std::mutex> vl(s_val_mtx);
+                auto p = s_price.find(81143LL);  // Magmatic Gas
+                if (p != s_price.end() && p->second > 0)
+                    row["unsec_m3"] = isk / p->second * 0.01;
+            }
+            row["est"] = true;
+        }
+
     // structure notifications: a much faster signal than the hourly corp
     // structures dataset (attacks land within ~10 min, plus anchoring and
     // destruction events the list itself won't show until the next roll)

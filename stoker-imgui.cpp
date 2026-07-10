@@ -480,21 +480,27 @@ static void dual_gauge(const Row& r, float w) {
         // bar 1 = raidable surplus bay (what a thief gets, so fuller = redder),
         // bar 2 = reserve hold, bar 3 = NA (skyhooks burn nothing)
         ImVec2 p2(p.x, p.y + h + 2), p3(p.x, p.y + 2 * (h + 2));
-        if (r.sky_bays && r.sky_unsec_m3 >= 0) {
+        if (r.sky_unsec_m3 >= 0) {
+            // live owner data, or the accrual estimate since the last raid
+            // ("~" marks the estimate)
+            const char* tilde = r.sky_est ? "~" : "";
             char pc[32];
-            std::snprintf(pc, sizeof pc, "%.0f%%",
-                          100.0 * r.sky_unsec_m3 / SKY_RAIDABLE_M3);
+            std::snprintf(pc, sizeof pc, "%s%.0f%%", tilde,
+                          100.0 * std::min(1.0, r.sky_unsec_m3 / SKY_RAIDABLE_M3));
             mini_bar(dl, p, w, h, r.sky_unsec_m3 / SKY_RAIDABLE_M3, pc,
-                     isk_compact(r.sky_unsec_isk < 0 ? 0 : r.sky_unsec_isk) + " isk", false,
-                     g_ic_gas, true);
+                     tilde + isk_compact(r.sky_unsec_isk < 0 ? 0 : r.sky_unsec_isk) + " isk",
+                     false, g_ic_gas, true);
+        } else {
+            mini_bar(dl, p, w, h, -1, "NA", "", false, 0);
+        }
+        if (r.sky_bays && r.sky_sec_m3 >= 0) {
             char sc[32];
             std::snprintf(sc, sizeof sc, "%.0f%%", 100.0 * r.sky_sec_m3 / SKY_RESERVE_M3);
             mini_bar(dl, p2, w, h, r.sky_sec_m3 / SKY_RESERVE_M3, sc,
                      isk_compact(r.sky_sec_isk < 0 ? 0 : r.sky_sec_isk) + " isk", true,
                      g_ic_gas);
-        } else {  // no owner token: bays unreadable
-            mini_bar(dl, p, w, h, -1, "?", "", false, g_ic_gas);
-            mini_bar(dl, p2, w, h, -1, "?", "", true, g_ic_gas);
+        } else {  // reserve hold is the sov holder's, invisible to renters
+            mini_bar(dl, p2, w, h, -1, "NA", "", true, 0);
         }
         mini_bar(dl, p3, w, h, -1, "NA", "", false, 0);
         ImGui::Dummy(ImVec2(w, gauge_cell_h(3)));
@@ -1553,13 +1559,23 @@ int main(int argc, char** argv) {
                                 ImGui::SameLine();
                                 ImGui::TextColored(TEXTC, "%s ISK/h", commas(d->sky_hourly).c_str());
                             }
-                            if (d->sky_bays && d->sky_unsec_m3 >= 0) {
+                            if (d->sky_unsec_m3 >= 0) {
+                                const char* tld = d->sky_est ? "~" : "";
                                 ImGui::TextColored(GREY_, "Raidable bay:");
                                 ImGui::SameLine();
-                                ImGui::TextColored(TEXTC, "%s m3 / %s  (%s isk exposed)",
-                                                   commas(d->sky_unsec_m3).c_str(),
-                                                   commas(SKY_RAIDABLE_M3).c_str(),
+                                ImGui::TextColored(TEXTC, "%s%s m3 / %s  (%s%s isk exposed)",
+                                                   tld, commas(d->sky_unsec_m3).c_str(),
+                                                   commas(SKY_RAIDABLE_M3).c_str(), tld,
                                                    isk_compact(d->sky_unsec_isk).c_str());
+                                if (d->sky_est)
+                                    ImGui::TextColored(GREY_,
+                                                       "estimated: half of production since "
+                                                       "last raid (%s)",
+                                                       d->sky_last_raided.empty()
+                                                           ? "tracking start"
+                                                           : rel_age(d->sky_last_raided).c_str());
+                            }
+                            if (d->sky_bays && d->sky_sec_m3 >= 0) {
                                 ImGui::TextColored(GREY_, "Reserve hold:");
                                 ImGui::SameLine();
                                 ImGui::TextColored(TEXTC, "%s m3 / %s  (%s isk banked)",

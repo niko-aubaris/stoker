@@ -117,8 +117,10 @@ struct Row {
     int sky_streak = -1, sky_unraided = -1, sky_raided = -1;
     std::string sky_wstart, sky_wend;       // current/next theft window (ISO)
     bool sky_bays = false;                  // owner-level bay data present
+    bool sky_est = false;                   // surplus figures are an estimate
     double sky_unsec_m3 = -1, sky_unsec_isk = -1;  // raidable (surplus) bay
     double sky_sec_m3 = -1, sky_sec_isk = -1;      // reserve (secure) hold
+    std::string sky_last_raided;            // estimate clock start (ISO)
     std::vector<RefuelEvent> log;     // this structure's last refuel events
 };
 
@@ -538,7 +540,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.7.1";
+static const char* STOKER_VERSION = "v2.7.2";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -907,10 +909,12 @@ static void ingest(const std::string& raw) {
         r.sky_wstart = sstr("window_start");
         r.sky_wend = sstr("window_end");
         r.state = sstr("state");  // owner endpoint supplies real states
+        r.sky_unsec_m3 = snum("unsec_m3");
+        r.sky_unsec_isk = snum("unsec_isk");
+        r.sky_est = s.value("est", false);
+        r.sky_last_raided = sstr("last_raided_at");
         if (s.value("bays_ok", false)) {
             r.sky_bays = true;
-            r.sky_unsec_m3 = snum("unsec_m3");
-            r.sky_unsec_isk = snum("unsec_isk");
             r.sky_sec_m3 = snum("sec_m3");
             r.sky_sec_isk = snum("sec_isk");
         }
