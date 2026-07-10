@@ -293,7 +293,7 @@ static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac,
         float x = rightside ? p.x + w - ts.x - 4 : tx0;
         ImVec2 tp(x, p.y + (h - ts.y) * 0.5f);
         dl->PushClipRect(p, ImVec2(fillx, p.y + h), true);
-        dl->AddText(fnt, fs, tp, IM_COL32(255, 255, 255, 255), s.c_str());
+        dl->AddText(fnt, fs, tp, IM_COL32(12, 12, 18, 255), s.c_str());
         dl->PopClipRect();
         dl->PushClipRect(ImVec2(fillx, p.y), ImVec2(p.x + w, p.y + h), true);
         dl->AddText(fnt, fs, tp, col, s.c_str());
@@ -479,7 +479,7 @@ static void gauge(const char* id, double frac, const std::string& left,
         float x = rightside ? p.x + w - ts.x - 5 : tx0;
         ImVec2 tp(x, p.y + 2);
         dl->PushClipRect(p, ImVec2(fillx, p.y + h), true);
-        dl->AddText(tp, IM_COL32(255, 255, 255, 255), s.c_str());
+        dl->AddText(tp, IM_COL32(12, 12, 18, 255), s.c_str());
         dl->PopClipRect();
         dl->PushClipRect(ImVec2(fillx, p.y), ImVec2(p.x + w, p.y + h), true);
         dl->AddText(tp, col, s.c_str());
