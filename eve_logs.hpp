@@ -119,13 +119,41 @@ static std::string logs_read_new(const std::filesystem::path& p, LogTail& t) {
     std::string buf((size_t)(size - t.off), 0);
     f.read(&buf[0], (std::streamsize)buf.size());
     buf.resize((size_t)f.gcount());
-    t.off += (std::streamoff)buf.size();
+    // consume whole lines only: cut at the last UTF-16LE newline, so a line
+    // caught mid-flush is retried next sweep and an odd-length read can never
+    // shift the 2-byte alignment for the rest of the session
+    size_t keep = 0;
+    for (size_t i = buf.size() & ~(size_t)1; i >= 2; i -= 2)
+        if ((unsigned char)buf[i - 2] == 0x0A && buf[i - 1] == 0) {
+            keep = i;
+            break;
+        }
+    if (keep == 0) {
+        if (buf.size() < 262144) return "";  // mid-line: wait for the rest
+        keep = buf.size() & ~(size_t)1;      // pathological no-newline blob
+    }
+    buf.resize(keep);
+    t.off += (std::streamoff)keep;
     return utf16le_to_utf8(buf);
 }
 
-static std::string lower_(std::string s) {
-    for (auto& c : s) c = (char)tolower((unsigned char)c);
-    return s;
+// chat-log timestamps are EVE time (UTC): "[ 2026.07.09 22:15:04 ]"
+static time_t chat_ts(const std::string& d, const std::string& tt) {
+    std::tm tm{};
+    int hh = 0, mm = 0, ss = 0;
+    if (std::sscanf(d.c_str(), "%d.%d.%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday) != 3)
+        return 0;
+    if (std::sscanf(tt.c_str(), "%d:%d:%d", &hh, &mm, &ss) < 2) return 0;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    tm.tm_hour = hh;
+    tm.tm_min = mm;
+    tm.tm_sec = ss;
+#ifdef _WIN32
+    return _mkgmtime(&tm);
+#else
+    return timegm(&tm);
+#endif
 }
 
 // strip chat punctuation so "4-P4FE," and "*4-P4FE*" still match
@@ -154,7 +182,8 @@ static bool is_intel_channel(const std::string& channel) {
 }
 
 static void eve_logs_scan() {
-    static time_t last_scan = 0, last_dirtry = 0;
+    static time_t last_scan = 0, last_dirtry = 0, last_enum = 0;
+    static std::vector<std::string> live;  // files worth tailing this session
     time_t nowt = time(nullptr);
     if (nowt - last_scan < 2) return;
     last_scan = nowt;
@@ -167,12 +196,52 @@ static void eve_logs_scan() {
     load_universe();
     namespace fs = std::filesystem;
     static const std::regex fname_re(R"(^(.*)_(\d{8})_(\d{6})(_\d+)?$)");
-    static const std::regex line_re(R"(\[\s*[\d.]+\s+[\d:]+\s*\]\s*(.*?)\s*>\s*(.*))");
+    static const std::regex line_re(R"(\[\s*([\d.]+)\s+([\d:]+)\s*\]\s*(.*?)\s*>\s*(.*))");
+
+    // the full directory sweep runs every 15s (EVE never prunes Chatlogs, so
+    // big installs have tens of thousands of files); between sweeps only the
+    // known-live files are re-tailed. Old session files are skipped by their
+    // filename date before any stat call.
+    if (nowt - last_enum >= 15) {
+        last_enum = nowt;
+        live.clear();
+        char cutoff[16];
+        time_t cut_t = nowt - 48 * 3600;  // session START date; sessions run long
+        std::tm ctm{};
+#ifdef _WIN32
+        gmtime_s(&ctm, &cut_t);
+#else
+        gmtime_r(&cut_t, &ctm);
+#endif
+        std::strftime(cutoff, sizeof cutoff, "%Y%m%d", &ctm);
+        std::error_code ec;
+        for (fs::directory_iterator it(g_logs_dir, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            fs::path p = it->path();
+            if (p.extension() != ".txt") continue;
+            std::string stem;
+            try {
+                stem = p.stem().string();
+            } catch (...) {
+                continue;
+            }
+            std::smatch fm;
+            if (!std::regex_match(stem, fm, fname_re)) continue;
+            if (fm[2].str() < cutoff) continue;  // old session: no stat needed
+            std::string channel = fm[1].str();
+            if (lower_(channel) != "local" && !is_intel_channel(channel)) continue;
+            live.push_back(p.string());
+            g_tails[p.string()].channel = channel;
+        }
+        for (auto it2 = g_tails.begin(); it2 != g_tails.end();)  // drop aged-out tails
+            it2 = std::find(live.begin(), live.end(), it2->first) == live.end()
+                      ? g_tails.erase(it2)
+                      : std::next(it2);
+    }
+
     std::error_code ec;
-    for (fs::directory_iterator it(g_logs_dir, ec), end; !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) continue;
-        fs::path p = it->path();
-        if (p.extension() != ".txt") continue;
+    for (auto& path : live) {
+        fs::path p = path;
         auto ft = fs::last_write_time(p, ec);
         if (ec) continue;
         time_t mt = (time_t)std::chrono::duration_cast<std::chrono::seconds>(
@@ -181,18 +250,11 @@ static void eve_logs_scan() {
                         .count() +
                     nowt;
         if (nowt - mt > 12 * 3600) continue;  // stale session
-        std::smatch fm;
-        std::string stem = p.stem().string();
-        if (!std::regex_match(stem, fm, fname_re)) continue;
-        std::string channel = fm[1].str();
-        bool is_local = lower_(channel) == "local";
-        if (!is_local && !is_intel_channel(channel)) continue;
-
-        LogTail& t = g_tails[p.string()];
-        t.channel = channel;
+        LogTail& t = g_tails[path];
         t.mtime = mt;
         std::string text = logs_read_new(p, t);
         if (text.empty()) continue;
+        bool is_local = lower_(t.channel) == "local";
 
         std::istringstream ss(text);
         std::string line;
@@ -208,7 +270,7 @@ static void eve_logs_scan() {
             }
             std::smatch m;
             if (!std::regex_search(line, m, line_re)) continue;
-            std::string pilot = m[1].str(), msg = m[2].str();
+            std::string pilot = m[3].str(), msg = m[4].str();
             if (is_local) {
                 size_t cp = msg.find("Channel changed to Local : ");
                 if (pilot == "EVE System" && cp != std::string::npos)
@@ -217,13 +279,14 @@ static void eve_logs_scan() {
             }
             if (pilot == "EVE System") continue;
             // intel line: first token that names a system wins; clr/clear
-            // lines retire that system's intel instead
+            // retires that system's intel instead ("status" is a QUESTION in
+            // intel convention, never an all-clear)
             std::istringstream ws(msg);
             std::string tok, sys;
             bool clr = false;
             while (ws >> tok) {
                 std::string ct = lower_(clean_token(tok));
-                if (ct == "clr" || ct == "clear" || ct == "status") clr = true;
+                if (ct == "clr" || ct == "clear") clr = true;
                 if (sys.empty() && g_sysid.count(ct)) sys = g_sysname[g_sysid[ct]];
             }
             if (sys.empty()) continue;
@@ -232,7 +295,10 @@ static void eve_logs_scan() {
                     iit = iit->system == sys ? g_intel.erase(iit) : iit + 1;
                 continue;
             }
-            g_intel.push_front({sys, channel, pilot, msg, nowt});
+            // the line's own (UTC) timestamp: backfilled history must not
+            // flash as if it were breaking news
+            time_t at = chat_ts(m[1].str(), m[2].str());
+            g_intel.push_front({sys, t.channel, pilot, msg, at ? at : nowt});
         }
     }
     while (g_intel.size() > 40 || (!g_intel.empty() && nowt - g_intel.back().at > 1800))

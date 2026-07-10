@@ -1036,41 +1036,54 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
 
     // Moongoo valuation: public market averages (hourly cache) plus type
     // name/volume (session cache; the moon-material set is a few dozen types).
+    // The slow HTTP work happens OUTSIDE the mutex so parallel corp sweeps
+    // never serialize on a 30s curl call; the hour slot is claimed up front,
+    // so a failed price pull simply retries next hour (best effort).
     static std::mutex s_val_mtx;
     static std::map<long long, double> s_price;
     static time_t s_price_at = 0;
     static std::map<long long, std::pair<std::string, double>> s_type;  // name, m3/unit
     if (!goo_at.empty()) {
-        std::lock_guard<std::mutex> vl(s_val_mtx);
-        if (time(nullptr) - s_price_at > 3600) {
-            try {
-                json pj = json::parse(http_get_body(
-                    ESI + std::string("/markets/prices/?datasource=tranquility")));
-                for (auto& e : pj) {
-                    double ap = e.contains("average_price") && e["average_price"].is_number()
-                                    ? e["average_price"].get<double>()
-                                    : e.value("adjusted_price", 0.0);
-                    s_price[e.value("type_id", 0LL)] = ap;
-                }
+        bool need_prices = false;
+        std::vector<long long> missing;
+        {
+            std::lock_guard<std::mutex> vl(s_val_mtx);
+            if (time(nullptr) - s_price_at > 3600) {
                 s_price_at = time(nullptr);
-            } catch (...) { /* valuation is best-effort */ }
+                need_prices = true;
+            }
+            for (auto& lt : goo_at)
+                for (auto& tq : lt.second)
+                    if (!s_type.count(tq.first)) {
+                        // placeholder claims the id so sibling threads skip it
+                        s_type[tq.first] = {"type " + std::to_string(tq.first), 0.0};
+                        missing.push_back(tq.first);
+                    }
         }
-        for (auto& lt : goo_at)
-            for (auto& tq : lt.second)
-                if (!s_type.count(tq.first)) try {
-                    json tj = json::parse(http_get_body(
-                        ESI + std::string("/universe/types/") + std::to_string(tq.first) +
-                        "/?datasource=tranquility"));
-                    s_type[tq.first] = {tj.value("name", "type " + std::to_string(tq.first)),
-                                        tj.value("volume", 0.0)};
-                } catch (...) {
-                    s_type[tq.first] = {"type " + std::to_string(tq.first), 0.0};
-                }
+        if (need_prices) try {
+            json pj = json::parse(http_get_body(
+                ESI + std::string("/markets/prices/?datasource=tranquility")));
+            std::lock_guard<std::mutex> vl(s_val_mtx);
+            for (auto& e : pj) {
+                double ap = e.contains("average_price") && e["average_price"].is_number()
+                                ? e["average_price"].get<double>()
+                                : e.value("adjusted_price", 0.0);
+                s_price[e.value("type_id", 0LL)] = ap;
+            }
+        } catch (...) { /* valuation is best-effort */ }
+        for (long long tid : missing) try {
+            json tj = json::parse(http_get_body(ESI + std::string("/universe/types/") +
+                                                std::to_string(tid) +
+                                                "/?datasource=tranquility"));
+            std::lock_guard<std::mutex> vl(s_val_mtx);
+            s_type[tid] = {tj.value("name", "type " + std::to_string(tid)),
+                           tj.value("volume", 0.0)};
+        } catch (...) { /* keep the placeholder */ }
     }
 
     // Athanor/Tatara moon-pull schedule. Needs esi-industry.read_corporation_mining.v1
-    // on the token - config "scopes" opt-in until the shared dev app allows it
-    // (adding it to the default SCOPE before then would break new logins).
+    // on the token (in the default SCOPE since v2.5.0; the shared dev app allows
+    // it - tokens minted earlier need a re-login).
     std::map<long long, std::pair<std::string, std::string>> extr;  // sid -> start, arrival
     bool extr_ok = false;
     if (token_has_scope(tok, "esi-industry.read_corporation_mining.v1")) {
@@ -1107,6 +1120,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     out["corp"] = corp_display;  // the header brands itself with this
     out["fuel2_status"] = fuel2_status;
     out["extractions_ok"] = extr_ok;
+    out["timers_ok"] = true;  // this feed carries state timers; the corp feed doesn't
     out["pulled_at"] = now_iso;
     std::string lm = http_date_to_iso(hdr.value("last-modified", std::string()));
     std::string ex = http_date_to_iso(hdr.value("expires", std::string()));

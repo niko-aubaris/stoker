@@ -19,14 +19,24 @@
 #include <regex>
 #include <set>
 
+static std::string lower_(std::string s) {
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
 // --- the map (same layout as eveterm: DOTLAN region SVG positions + the
 // embedded New Eden gate graph) -------------------------------------------------
-struct MapNode { int id = 0; std::string label; double nx = 0, ny = 0; };
+struct MapNode {
+    int id = 0;
+    std::string label, llabel;  // llabel: lowercased once at build time
+    double nx = 0, ny = 0;
+};
 struct MapView {
     std::string region, error;
     bool loading = false, ok = false;
     std::vector<MapNode> nodes;
     std::vector<std::pair<int, int>> gates;
+    std::vector<std::pair<int, int>> jb;  // jump-bridge node-index pairs
     float zoom = 1.0f;
     ImVec2 pan{0.5f, 0.5f};  // normalized center
     int selected = -1;
@@ -41,8 +51,24 @@ static std::vector<std::pair<int, int>> g_jbridges;  // friendly Ansiblex networ
 struct RegionLabel { std::string name; double nx = 0, ny = 0; };
 static std::vector<RegionLabel> g_region_labels;
 
+// resolve the friendly-bridge id pairs to node indexes at build time so the
+// draw loop never rebuilds an id lookup per frame
+static void map_resolve_bridges(MapView& m, const std::map<int, int>& idx) {
+    for (auto& jb : g_jbridges) {
+        auto a = idx.find(jb.first), b = idx.find(jb.second);
+        if (a != idx.end() && b != idx.end()) m.jb.push_back({a->second, b->second});
+    }
+}
+
+// Called from BOTH the render thread (eve_logs_scan, banner, set destination)
+// and spawn_bg map builders, so the whole load is mutexed; a failed parse is
+// tried once, not per frame.
 static void load_universe() {
-    if (!g_adj.empty()) return;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
     try {
         json j = json::parse(std::string((const char*)kJumpmapJson, kJumpmapSize));
         for (auto& [k, v] : j["names"].items()) {
@@ -92,15 +118,15 @@ static void act_build_universe() {
         for (auto& kv : g_syspos) {
             if (!g_adj.count(kv.first)) continue;
             idx[kv.first] = (int)m.nodes.size();
-            m.nodes.push_back({kv.first,
-                               g_sysname.count(kv.first) ? g_sysname[kv.first]
-                                                         : std::to_string(kv.first),
-                               kv.second.nx, kv.second.ny});
+            std::string nm = g_sysname.count(kv.first) ? g_sysname[kv.first]
+                                                       : std::to_string(kv.first);
+            m.nodes.push_back({kv.first, nm, lower_(nm), kv.second.nx, kv.second.ny});
         }
         for (auto& kv : idx)
             for (int nb : g_adj[kv.first])
                 if (kv.first < nb && idx.count(nb))
                     m.gates.push_back({kv.second, idx.at(nb)});
+        map_resolve_bridges(m, idx);
         m.ok = !m.nodes.empty();
         if (!m.ok) m.error = "no universe layout embedded in this build";
         std::lock_guard<std::mutex> l(g_mtx);
@@ -153,7 +179,8 @@ static void act_build_map(std::string region) {
             if (idx.count(id)) continue;
             double x = std::stod((*it)[2]) + 31.0, y = std::stod((*it)[3]) + 15.0;
             idx[id] = (int)m.nodes.size();
-            m.nodes.push_back({id, g_sysname.count(id) ? g_sysname[id] : std::to_string(id), x, y});
+            std::string nm = g_sysname.count(id) ? g_sysname[id] : std::to_string(id);
+            m.nodes.push_back({id, nm, lower_(nm), x, y});
             minx = std::min(minx, x); maxx = std::max(maxx, x);
             miny = std::min(miny, y); maxy = std::max(maxy, y);
         }
@@ -166,6 +193,7 @@ static void act_build_map(std::string region) {
                 for (int nb : g_adj.count(kv.first) ? g_adj[kv.first] : std::vector<int>{})
                     if (kv.first < nb && idx.count(nb))
                         m.gates.push_back({kv.second, idx.at(nb)});
+            map_resolve_bridges(m, idx);
             m.ok = true;
         }
         std::lock_guard<std::mutex> l(g_mtx);
@@ -213,13 +241,17 @@ static const ImVec4 PINK(1.00f, 0.17f, 0.84f, 1), CYAN_(0.00f, 0.90f, 1.00f, 1),
     DIMCYAN(0.00f, 0.51f, 0.59f, 1), GREY_(0.50f, 0.53f, 0.59f, 1),
     TEXTC(0.90f, 0.92f, 0.96f, 1);
 
-static ImU32 band_u32(int band, bool secondary = false) {
+static const ImU32 kGreyU32 = IM_COL32(128, 136, 150, 255);  // no-data placeholder
+
+// stepped urgency colours: only the map dots still use these (the gauges
+// moved to the continuous ramp_u32)
+static ImU32 band_u32(int band) {
     switch (band) {
         case 0: return IM_COL32(255, 70, 70, 255);
         case 1: return IM_COL32(255, 140, 0, 255);
         case 2: return IM_COL32(250, 215, 70, 255);
-        case 3: return secondary ? IM_COL32(172, 128, 255, 255) : IM_COL32(56, 216, 232, 255);
-        default: return IM_COL32(128, 136, 150, 255);
+        case 3: return IM_COL32(56, 216, 232, 255);
+        default: return kGreyU32;
     }
 }
 
@@ -262,7 +294,7 @@ static std::map<std::string, ImTextureID> g_type_icons;  // display type -> port
 static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac,
                      const std::string& left, const std::string& right, bool secondary,
                      ImTextureID icon, bool invert = false) {
-    ImU32 col = band_u32(-1);
+    ImU32 col = kGreyU32;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 2.0f);
     float fillx = p.x;
     if (frac >= 0) {
@@ -365,7 +397,9 @@ static void timer_info(const Row& r, std::string& txt, ImU32& col) {
         if (ua > nowt) te = ua;  // the unanchor completion clock
     }
     if (te <= nowt) {
-        txt = "NONE";
+        // a feed without timer fields (the corp-mode backend) can't say NONE
+        // honestly: show unknown instead of implying there is no clock
+        txt = g_timers_ok ? "NONE" : "?";
         col = IM_COL32(128, 136, 150, 255);
         return;
     }
@@ -412,7 +446,7 @@ static void moonpull_info(const Row& r, bool extr_ok, std::string& txt, ImU32& c
 static void dual_gauge(const Row& r, float w) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    float h = ((ImGui::GetTextLineHeight() + 6) * 2 - 2) / 2;
+    float h = gauge_cell_h(1);  // one strip; keep in lockstep with the row height
     bool has2 = !r.fuel2_name.empty();
     char b[32];
     std::snprintf(b, sizeof b, "%.1fd", r.days);
@@ -457,7 +491,7 @@ static void gauge(const char* id, double frac, const std::string& left,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
     float h = ImGui::GetTextLineHeight() + 4;
-    ImU32 col = band_u32(-1);
+    ImU32 col = kGreyU32;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 3.0f);
     if (frac >= 0) {
         float f = frac > 1 ? 1.f : (float)frac;
@@ -582,6 +616,20 @@ static void act_claim(long long sid) {
     });
 }
 
+// on-demand re-check (startup checks once; long-running sessions can ask again)
+static void act_check_update() {
+    if (g_busy) return;
+    spawn_bg([]() {
+        check_update();
+        std::lock_guard<std::mutex> l(g_mtx);
+        if (g_update_tag.empty()) {
+            g_note = std::string("up to date (") + STOKER_VERSION + ")";
+            g_note_at = time(nullptr);
+        }
+        if (g_gui_wake) g_gui_wake();
+    });
+}
+
 static void act_update(const std::string& tag, const std::string& url) {
     if (g_busy) return;
     g_busy = true;
@@ -687,22 +735,30 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        std::vector<Row> rows;
-        std::vector<Refuel> refuels;
-        std::vector<std::string> tabs;
+        // heavy snapshots (rows/logs/notifs/tabs) are only re-copied when an
+        // ingest bumped the generation - the flash-mode fast loop would
+        // otherwise deep-copy the whole dataset 16 times a second; the cheap
+        // strings still refresh every frame
+        static std::vector<Row> rows;
+        static std::vector<Refuel> refuels;
+        static std::vector<std::string> tabs;
+        static std::vector<Notif> notifs;
+        static unsigned long long seen_gen = ~0ull;
         std::string status, note, corpname, upd, updurl, pulled, esiMod;
         int tabsel;
         bool rentals_online, extractions_ok;
-        std::vector<Notif> notifs;
         {
             std::lock_guard<std::mutex> l(g_mtx);
-            rows = g_rows;
-            refuels = g_refuels;
-            tabs = g_tab_labels;
+            if (seen_gen != g_data_gen) {
+                seen_gen = g_data_gen;
+                rows = g_rows;
+                refuels = g_refuels;
+                tabs = g_tab_labels;
+                notifs = g_notifs;
+            }
             tabsel = g_tab;
             rentals_online = g_rentals_online;
             extractions_ok = g_extractions_ok;
-            notifs = g_notifs;
             status = g_status;
             corpname = g_corp_name;
             upd = g_update_tag;
@@ -718,10 +774,11 @@ int main(int argc, char** argv) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                          ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        // header row
+        // header row; the version doubles as a check-for-updates button
         ImGui::TextColored(PINK, "STOKER");
         ImGui::SameLine();
-        ImGui::TextColored(GREY_, "%s", STOKER_VERSION);
+        if (ImGui::SmallButton(STOKER_VERSION)) act_check_update();
+        ImGui::SetItemTooltip("check for updates");
         ImGui::SameLine();
         ImGui::TextColored(DIMCYAN, " %s fuel watch",
                            corpname.empty() ? "..." : corpname.c_str());
@@ -786,7 +843,15 @@ int main(int argc, char** argv) {
 
         if (mode == 1) {
             static char region[64] = {0};
-            static bool autocentered = false;
+            // autocenter upgrades as better anchors appear: 0 = not yet,
+            // 1 = centred on a structure, 2 = centred on the pilot; a corp-tab
+            // switch resets so the view follows the corp being looked at
+            static int centered = 0;
+            static int centered_tab = -1;
+            if (centered_tab != tabsel) {
+                centered_tab = tabsel;
+                centered = 0;
+            }
             MapView mv;
             {
                 std::lock_guard<std::mutex> l(g_mtx);
@@ -794,18 +859,17 @@ int main(int argc, char** argv) {
             }
             // default view: the whole universe, centred on the pilot's region
             if (!mv.ok && !mv.loading && mv.error.empty()) act_build_universe();
-            if (mv.ok && mv.region == "New Eden" && !autocentered) {
-                // pilot position when the client logs give us one, else the
-                // first tracked structure's system
+            if (mv.ok && mv.region == "New Eden") {
+                int want = !g_pilots.empty() ? 2 : (!rows.empty() ? 1 : 0);
                 std::string cs = !g_pilots.empty() ? g_pilots[0].system
                                  : !rows.empty()   ? rows[0].system
                                                    : "";
-                if (!cs.empty()) {
+                if (want > centered && !cs.empty()) {
                     std::lock_guard<std::mutex> l(g_mtx);
                     auto sit = g_sysid.find(lower_(cs));
                     if (sit != g_sysid.end()) {
                         map_center_on_system(g_map, sit->second);
-                        autocentered = true;
+                        centered = want;
                         mv = g_map;
                     }
                 }
@@ -818,7 +882,7 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Button("universe")) {
                 act_build_universe();
-                autocentered = false;  // re-centre on the pilot once it rebuilds
+                centered = 0;  // re-centre once it rebuilds
             }
             ImGui::SameLine();
             if (ImGui::Button("me") && !g_pilots.empty()) {
@@ -905,24 +969,17 @@ int main(int argc, char** argv) {
                     }
                 }
                 // friendly Ansiblex bridges: blue arcs over the gate lines,
-                // matching eveterm's map
-                if (!g_jbridges.empty()) {
-                    std::map<int, int> byid;
-                    for (int i = 0; i < (int)mv.nodes.size(); i++) byid[mv.nodes[i].id] = i;
-                    for (auto& jb : g_jbridges) {
-                        auto a = byid.find(jb.first), b = byid.find(jb.second);
-                        if (a == byid.end() || b == byid.end()) continue;
-                        ImVec2 pa = at(mv.nodes[a->second]), pb = at(mv.nodes[b->second]);
-                        if ((pa.x < p0.x && pb.x < p0.x) || (pa.y < p0.y && pb.y < p0.y) ||
-                            (pa.x > p0.x + sz.x && pb.x > p0.x + sz.x) ||
-                            (pa.y > p0.y + sz.y && pb.y > p0.y + sz.y))
-                            continue;
-                        ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
-                        ImVec2 d(pb.x - pa.x, pb.y - pa.y);
-                        dl->AddBezierQuadratic(pa,
-                                               ImVec2(mid.x - d.y * 0.18f, mid.y + d.x * 0.18f),
-                                               pb, IM_COL32(90, 175, 255, 220), 1.6f);
-                    }
+                // matching eveterm's map (endpoints resolved at map build)
+                for (auto& jb : mv.jb) {
+                    ImVec2 pa = at(mv.nodes[jb.first]), pb = at(mv.nodes[jb.second]);
+                    if ((pa.x < p0.x && pb.x < p0.x) || (pa.y < p0.y && pb.y < p0.y) ||
+                        (pa.x > p0.x + sz.x && pb.x > p0.x + sz.x) ||
+                        (pa.y > p0.y + sz.y && pb.y > p0.y + sz.y))
+                        continue;
+                    ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
+                    ImVec2 d(pb.x - pa.x, pb.y - pa.y);
+                    dl->AddBezierQuadratic(pa, ImVec2(mid.x - d.y * 0.18f, mid.y + d.x * 0.18f),
+                                           pb, IM_COL32(90, 175, 255, 220), 1.6f);
                 }
                 int clicked = -1;
                 // on the universe map, labels only appear once zoomed in enough
@@ -942,12 +999,16 @@ int main(int argc, char** argv) {
                         dot = band_u32(worst);
                         dl->AddCircle(q, 7.0f, dot, 0, 2.0f);
                     }
-                    std::string ll = lower_(mv.nodes[i].label);
+                    const std::string& ll = mv.nodes[i].llabel;
                     if (auto ia = intel_at.find(ll); ia != intel_at.end()) {
                         double age = difftime(time(nullptr), ia->second);
-                        int alpha = age < 300
-                                        ? (int)(150 + 105 * std::sin(ImGui::GetTime() * 6.0))
-                                        : (int)(255 * (1.0 - age / 1800.0));
+                        int alpha;
+                        if (age < 300) {
+                            alpha = (int)(150 + 105 * std::sin(ImGui::GetTime() * 6.0));
+                            g_flash_active = true;  // keep the event loop fast enough
+                        } else {
+                            alpha = (int)(255 * (1.0 - age / 1800.0));
+                        }
                         if (alpha > 0)
                             dl->AddCircle(q, 12.0f, IM_COL32(255, 60, 60, alpha), 0, 2.5f);
                     }
@@ -1035,24 +1096,49 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        // per-corp type-tab memory: switching corp tabs restores that corp's
+        // last pick (first visit uses the config tab_type_filter default)
+        std::string cur_label = (tabsel >= 0 && tabsel < (int)tabs.size()) ? tabs[tabsel] : "";
+        {
+            static std::map<std::string, std::string> type_mem;
+            static int last_tab = -1;
+            if (tabsel != last_tab) {
+                last_tab = tabsel;
+                auto mem = type_mem.find(cur_label);
+                if (mem != type_mem.end()) {
+                    g_type_tab = mem->second;
+                } else {
+                    auto dft = g_tab_default_filter.find(cur_label);
+                    g_type_tab = dft != g_tab_default_filter.end() ? dft->second : "";
+                }
+            }
+            type_mem[cur_label] = g_type_tab;
+        }
+
         // filter
         ImGui::SetNextItemWidth(260);
         ImGui::InputTextWithHint("##filter", "filter name/system/type", filter, sizeof filter);
-        // recent structure notifications, matched per row
+
+        // recent structure notifications, folded into per-sid sets once per
+        // frame (the render loop must not rescan the list per row)
         time_t nowt0 = time(nullptr);
-        auto notif_flag = [&](long long sid, std::initializer_list<const char*> types,
-                              long maxage) {
-            for (auto& n : notifs) {
-                if (n.sid != sid || !n.at || nowt0 - n.at > maxage) continue;
-                for (auto* t : types)
-                    if (n.type == t) return true;
-            }
-            return false;
-        };
+        std::set<long long> destroyed_sids, attacked_sids;
+        for (auto& n : notifs) {
+            if (!n.at) continue;
+            long age = (long)(nowt0 - n.at);
+            if (n.type == "StructureDestroyed" && age < 48 * 3600)
+                destroyed_sids.insert(n.sid);
+            else if (age < 1800 &&
+                     (n.type == "StructureUnderAttack" || n.type == "StructureLostShields" ||
+                      n.type == "StructureLostArmor"))
+                attacked_sids.insert(n.sid);
+        }
         auto row_gone = [&](const Row& r) {  // automated removal signals
-            return r.state == "unanchored" ||
-                   notif_flag(r.sid, {"StructureDestroyed"}, 48 * 3600);
+            return r.state == "unanchored" || destroyed_sids.count(r.sid) > 0;
         };
+        std::set<std::string> hot_systems;  // fresh intel, for the red system names
+        for (auto& ih : g_intel)
+            if (nowt0 - ih.at < 900) hot_systems.insert(ih.system);
         int suppressed = 0;
         for (auto& r : rows)
             if (row_gone(r)) suppressed++;
@@ -1073,40 +1159,9 @@ int main(int argc, char** argv) {
                 ImGui::TextColored(GREY_, "(%d rented hidden)", rented);
             }
         }
-        ImGui::SameLine();
-        int u14 = 0, u7 = 0;
-        for (auto& r : rows) {
-            if (r.has_fuel && r.days < 14) u14++;
-            if (r.has_fuel && r.days < 7) u7++;
-        }
-        ImGui::TextColored(GREY_, "  %d structures   under14d", (int)rows.size());
-        ImGui::SameLine();
-        ImGui::TextColored(u14 ? ImVec4(0.98f, 0.84f, 0.27f, 1) : ImVec4(0.35f, 0.88f, 0.51f, 1), "%d", u14);
-        ImGui::SameLine();
-        ImGui::TextColored(GREY_, "  under7d");
-        ImGui::SameLine();
-        ImGui::TextColored(u7 ? ImVec4(1, 0.27f, 0.27f, 1) : ImVec4(0.35f, 0.88f, 0.51f, 1), "%d", u7);
 
-        // brand-new structures the hourly list has not rolled in yet
-        {
-            std::map<long long, bool> have;
-            for (auto& r : rows) have[r.sid] = true;
-            for (auto& n : notifs) {
-                if (n.type != "StructureAnchoring" || !n.at || nowt0 - n.at > 24 * 3600)
-                    continue;
-                if (n.sid && have.count(n.sid)) continue;
-                load_universe();
-                std::string sys = g_sysname.count((int)n.system_id)
-                                      ? g_sysname[(int)n.system_id]
-                                      : "?";
-                ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1),
-                                   "new structure anchoring in %s - full data lands on the "
-                                   "next ESI roll",
-                                   sys.c_str());
-            }
-        }
-
-        // filtered view
+        // filtered view (built before the counters so the header numbers
+        // describe the rows the user can actually see)
         std::string f = filter;
         for (auto& c : f) c = (char)tolower((unsigned char)c);
         std::vector<const Row*> view;
@@ -1122,6 +1177,38 @@ int main(int argc, char** argv) {
                 if (hay.find(f) == std::string::npos) continue;
             }
             view.push_back(&r);
+        }
+        ImGui::SameLine();
+        int u14 = 0, u7 = 0;
+        for (auto* r : view) {
+            if (r->has_fuel && r->days < 14) u14++;
+            if (r->has_fuel && r->days < 7) u7++;
+        }
+        ImGui::TextColored(GREY_, "  %d structures   under14d", (int)view.size());
+        ImGui::SameLine();
+        ImGui::TextColored(u14 ? ImVec4(0.98f, 0.84f, 0.27f, 1) : ImVec4(0.35f, 0.88f, 0.51f, 1), "%d", u14);
+        ImGui::SameLine();
+        ImGui::TextColored(GREY_, "  under7d");
+        ImGui::SameLine();
+        ImGui::TextColored(u7 ? ImVec4(1, 0.27f, 0.27f, 1) : ImVec4(0.35f, 0.88f, 0.51f, 1), "%d", u7);
+
+        // brand-new structures the hourly list has not rolled in yet
+        {
+            load_universe();
+            std::map<long long, bool> have;
+            for (auto& r : rows) have[r.sid] = true;
+            for (auto& n : notifs) {
+                if (n.type != "StructureAnchoring" || !n.at || nowt0 - n.at > 24 * 3600)
+                    continue;
+                if (n.sid && have.count(n.sid)) continue;
+                std::string sys = g_sysname.count((int)n.system_id)
+                                      ? g_sysname[(int)n.system_id]
+                                      : "?";
+                ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1),
+                                   "new structure anchoring in %s - full data lands on the "
+                                   "next ESI roll",
+                                   sys.c_str());
+            }
         }
 
         // split: table left, detail/log right
@@ -1176,21 +1263,23 @@ int main(int argc, char** argv) {
                 dual_gauge(r, 240);
                 ImGui::TableSetColumnIndex(1);
                 {
-                    bool hot = false;
-                    time_t nowt = time(nullptr);
-                    for (auto& ih : g_intel)
-                        if (difftime(nowt, ih.at) < 900 && ih.system == r.system) {
-                            hot = true;
-                            break;
-                        }
+                    bool hot = hot_systems.count(r.system) > 0;
                     ImGui::TextColored(hot ? ImVec4(1, 0.27f, 0.27f, 1) : CYAN_, "%s",
                                        r.system.c_str());
                     // power state under the system name, derived the way the
                     // game derives it: fuel gone = Low Power, 7+ days without
-                    // fuel = Abandoned; all services off while fueled = Offline
+                    // fuel = Abandoned; all services off while fueled = Offline.
+                    // Structures still anchoring/onlining (or already
+                    // unanchored) have no fuel clock BY DESIGN: no false badge.
+                    bool limbo = r.state == "anchoring" || r.state == "anchor_vulnerable" ||
+                                 r.state == "deploy_vulnerable" ||
+                                 r.state == "fitting_invulnerable" ||
+                                 r.state == "onlining_vulnerable" || r.state == "unanchored";
                     const char* ftxt = nullptr;
                     ImU32 fcol = 0;
-                    if (r.has_fuel && r.days <= -7) {
+                    if (limbo) {
+                        // no power badge while the hull isn't in service yet
+                    } else if (r.has_fuel && r.days <= -7) {
                         ftxt = "ABANDONED";
                         fcol = IM_COL32(255, 70, 70, 255);
                     } else if (!r.has_fuel || r.days <= 0) {
@@ -1214,7 +1303,6 @@ int main(int argc, char** argv) {
                 }
                 ImGui::TableSetColumnIndex(2);
                 float rowh = gauge_cell_h(3);  // uniform: every row Metenox-sized
-                float cw = ImGui::GetContentRegionAvail().x;
                 ImVec2 cp = ImGui::GetCursorScreenPos();
                 if (ImGui::Selectable(("##row" + std::to_string(r.sid)).c_str(),
                                       r.sid == detail_sid,
@@ -1258,44 +1346,41 @@ int main(int argc, char** argv) {
                         dl2->AddText(fnt, fs, ImVec2(cp.x + ix + 13, y),
                                      IM_COL32(200, 206, 222, 255), lbl[li]);
                     }
-                    float tx =
-                        cp.x + ix + 13 + fnt->CalcTextSizeA(fs, 1e30f, 0, "Armour").x + 18;
-                    (void)cw;
+                    // constant label widths, measured once per frame
+                    static float w_armour = 0, w_moonpull = 0;
+                    static float w_for_fs = -1;
+                    if (w_for_fs != fs) {
+                        w_for_fs = fs;
+                        w_armour = fnt->CalcTextSizeA(fs, 1e30f, 0, "Armour").x;
+                        w_moonpull = fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x;
+                    }
+                    float tx = cp.x + ix + 13 + w_armour + 18;
                     {
                         dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
                                      "Timer:");
                         std::string tt;
                         ImU32 tc;
                         timer_info(r, tt, tc);
-                        dl2->AddText(fnt, fs,
-                                     ImVec2(tx + fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x +
-                                                6,
-                                            y0),
-                                     tc, tt.c_str());
+                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0), tc, tt.c_str());
                     }
-                    if (r.type == "Athanor" || r.type == "Tatara") {
+                    if (has_moon_pull(r.type)) {
                         dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
                                      "Moon Pull:");
                         std::string mt;
                         ImU32 mc;
                         moonpull_info(r, extractions_ok, mt, mc);
-                        dl2->AddText(fnt, fs,
-                                     ImVec2(tx + fnt->CalcTextSizeA(fs, 1e30f, 0, "Moon Pull:").x +
-                                                6,
-                                            y0 + sp),
-                                     mc, mt.c_str());
+                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp), mc,
+                                     mt.c_str());
                     }
                     // state warning under Moon Pull: no label, blank when calm,
                     // flashing triangle + text when something is happening.
-                    // Mapped from the ESI state enum + unanchors_at.
+                    // Mapped from the ESI state enum, unanchors_at, and the
+                    // (much faster) notification feed.
                     {
                         const char* wtxt = nullptr;
                         ImU32 wcol = 0;
                         time_t ua = r.unanchors_at.empty() ? 0 : parse_iso(r.unanchors_at);
-                        if (notif_flag(r.sid,
-                                       {"StructureUnderAttack", "StructureLostShields",
-                                        "StructureLostArmor"},
-                                       1800)) {
+                        if (attacked_sids.count(r.sid)) {
                             // notification-fed: fires within ~10 min of the hit,
                             // long before the hourly structure state catches up
                             wtxt = "UNDER ATTACK";
@@ -1307,8 +1392,13 @@ int main(int argc, char** argv) {
                         } else if (r.state == "unanchored") {
                             wtxt = "UNANCHORED";
                             wcol = IM_COL32(250, 215, 70, 255);
-                        } else if (ua > time(nullptr)) {
+                        } else if (ua > nowt0) {
                             wtxt = "UNANCHORING";
+                            wcol = IM_COL32(250, 215, 70, 255);
+                        } else if (ua && ua <= nowt0) {
+                            // unanchor finished but the hourly state hasn't
+                            // flipped yet: the hull is floating and scoopable
+                            wtxt = "UNANCHORED";
                             wcol = IM_COL32(250, 215, 70, 255);
                         } else if (r.state == "onlining_vulnerable") {
                             wtxt = "ONLINING...";
@@ -1371,7 +1461,7 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(GREY_, "Timer:");
                         ImGui::SameLine();
                         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tc), "%s", tt.c_str());
-                        if (d->type == "Athanor" || d->type == "Tatara") {
+                        if (has_moon_pull(d->type)) {
                             std::string mt;
                             ImU32 mc;
                             moonpull_info(*d, extractions_ok, mt, mc);

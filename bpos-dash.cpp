@@ -131,9 +131,15 @@ static std::string isk_compact(double v) {
 // still drive the fuel2/scope logic and the wire format).
 static std::string display_type(const std::string& t) {
     if (t == "Metenox Moon Drill") return "Metenox";
+    if (t == "Orbital Skyhook") return "Skyhook";
     if (t.rfind("Ansiblex", 0) == 0) return "Jump-Bridge";
     if (t.rfind("Pharolux", 0) == 0) return "Cyno Bacon";  // yes, bacon
     return t;
+}
+
+// refineries with a moon drill get the Moon Pull line
+static bool has_moon_pull(const std::string& display) {
+    return display == "Athanor" || display == "Tatara";
 }
 
 static double fuel2_days(const Row& r) {
@@ -188,6 +194,9 @@ static std::string g_corp_name;  // whose structures the active feed shows
 static std::string g_fuel2_status;  // ok|relogin|director|error|off - why F² has data or not
 static bool g_rentals_online = false;  // moon-rental classification feed reachable this pull
 static bool g_extractions_ok = false;  // corp mining extractions readable this pull
+static bool g_timers_ok = false;       // feed carries reinforcement timers (corp feed doesn't)
+static bool g_showing_cache = false;   // instant-boot snapshot on screen, live sweep pending
+static unsigned long long g_data_gen = 0;  // bumped per ingest; GUI re-copies only on change
 static std::string g_esi_lastmod, g_esi_expires;  // CCP regenerates hourly
 static std::string g_status = "connecting to the box...";
 static std::string g_note;         // last claim result, shown for a few seconds
@@ -517,7 +526,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.5.1";
+static const char* STOKER_VERSION = "v2.6.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -768,6 +777,14 @@ static void ingest(const std::string& raw) {
             r.has_fuel = true;
             r.days = s["fuel_days_left"].get<double>();
         }
+        // recompute the clock locally: feeds bake fuel_days_left at fetch time,
+        // and the instant-boot snapshot cache can replay hours-old data
+        if (!r.fuel_expires.empty()) {
+            if (time_t fe = parse_iso(r.fuel_expires)) {
+                r.has_fuel = true;
+                r.days = (double)(fe - time(nullptr)) / 86400.0;
+            }
+        }
         if (s.contains("burn_7d") && !s["burn_7d"].is_null()) r.burn7 = s["burn_7d"].get<double>();
         if (s.contains("burn_30d") && !s["burn_30d"].is_null()) r.burn30 = s["burn_30d"].get<double>();
         if (s.contains("est_fuel_days") && !s["est_fuel_days"].is_null()) r.est = s["est_fuel_days"].get<double>();
@@ -779,12 +796,12 @@ static void ingest(const std::string& raw) {
             r.fuel2 = s["fuel2_units"].get<double>();
         r.rental = s.value("rental", "");
         r.renter = s.value("renter", "");
-        auto numg = [&s](const char* k) -> double {
+        auto numf = [&s](const char* k) -> double {
             return (s.contains(k) && !s[k].is_null()) ? s[k].get<double>() : -1.0;
         };
-        r.goo_m3 = numg("goo_m3");
-        r.goo_cap = numg("goo_capacity");
-        r.goo_isk = numg("goo_isk");
+        r.goo_m3 = numf("goo_m3");
+        r.goo_cap = numf("goo_capacity");
+        r.goo_isk = numf("goo_isk");
         if (s.contains("goo") && s["goo"].is_array())
             for (auto& g : s["goo"]) {
                 GooItem gi;
@@ -794,9 +811,6 @@ static void ingest(const std::string& raw) {
                 gi.isk = g.value("isk", 0.0);
                 r.goo.push_back(std::move(gi));
             }
-        auto numf = [&s](const char* k) -> double {
-            return (s.contains(k) && !s[k].is_null()) ? s[k].get<double>() : -1.0;
-        };
         r.bpd = numf("blocks_per_day");
         r.blocks_now = numf("blocks_now");
         r.m3_now = numf("m3_now");
@@ -877,6 +891,8 @@ static void ingest(const std::string& raw) {
     g_fuel2_status = d.value("fuel2_status", "");
     g_rentals_online = d.value("rentals_online", false);
     g_extractions_ok = d.value("extractions_ok", false);
+    g_timers_ok = d.value("timers_ok", false);
+    g_data_gen++;
     g_esi_lastmod = d.contains("esi_last_modified") && !d["esi_last_modified"].is_null()
                         ? d["esi_last_modified"].get<std::string>() : "";
     g_esi_expires = d.contains("esi_expires") && !d["esi_expires"].is_null()
@@ -885,6 +901,8 @@ static void ingest(const std::string& raw) {
         g_status = "box error: " + d.value("error", "");
     else if (d.value("refreshing", false))
         g_status = "server pulling fresh ESI - data lands within ~1 min";
+    else if (g_showing_cache)  // tab switches re-ingest cached data; keep the notice
+        g_status = "showing cached data - refreshing from ESI...";
     else
         g_status = "";
 }
@@ -896,11 +914,36 @@ static void save_snap_cache(const std::vector<standalone::Snap>& snaps) {
     for (auto& s : snaps) any = any || !s.label.empty();
     if (!any) return;  // never cache the no-logins error placeholder
     try {
+        namespace fs = std::filesystem;
         json j = json::array();
-        for (auto& s : snaps) j.push_back({{"label", s.label}, {"data", s.data}});
-        std::ofstream f(standalone::config_dir() / "snap-cache.json",
-                        std::ios::binary | std::ios::trunc);
-        f << j.dump();
+        // a corp that failed THIS sweep keeps its previous cached snapshot:
+        // stale beats vanished on the next instant boot
+        std::vector<std::string> have;
+        for (auto& s : snaps) {
+            j.push_back({{"label", s.label}, {"data", s.data}});
+            have.push_back(s.label);
+        }
+        try {
+            json old = standalone::load_json_file(standalone::config_dir() / "snap-cache.json");
+            if (old.is_array())
+                for (auto& e : old) {
+                    std::string lbl = e.value("label", "");
+                    if (!lbl.empty() &&
+                        std::find(have.begin(), have.end(), lbl) == have.end())
+                        j.push_back(e);
+                }
+        } catch (...) {}
+        // atomic + private: tmp in the same dir, chmod, rename over the old
+        fs::path p = standalone::config_dir() / "snap-cache.json";
+        fs::path tmp = standalone::config_dir() / "snap-cache.json.tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f << j.dump();
+        }
+        std::error_code ec;
+        fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, ec);
+        fs::rename(tmp, p, ec);
     } catch (...) {}
 }
 
@@ -921,9 +964,11 @@ static bool load_snap_cache() {
             if (!g_tab_data.empty()) active = g_tab_data[g_tab];
         }
         if (active.empty()) return false;
-        ingest(active);
-        std::lock_guard<std::mutex> l(g_mtx);
-        g_status = "showing cached data - refreshing from ESI...";
+        {
+            std::lock_guard<std::mutex> l(g_mtx);
+            g_showing_cache = true;
+        }
+        ingest(active);  // ingest's tail keeps the cached-data notice up
         return true;
     } catch (...) {
         return false;
@@ -934,7 +979,25 @@ static bool load_snap_cache() {
 // active tab's. Used by both the poll loop and the manual refresh.
 static void standalone_cycle() {
     auto snaps = standalone::fetch_snapshots(g_client_id);
-    save_snap_cache(snaps);
+    bool ok = false;
+    for (auto& s : snaps) ok = ok || !s.label.empty();
+    if (!ok) {
+        // total failure (offline boot, expired logins): keep whatever is on
+        // screen - especially the instant-boot cache - instead of wiping it
+        std::string err;
+        try { err = json::parse(snaps[0].data).value("error", ""); } catch (...) {}
+        std::lock_guard<std::mutex> l(g_mtx);
+        if (!g_tab_data.empty()) {
+            g_status = (err.empty() ? std::string("refresh failed") : err) +
+                       " - showing previous data";
+            return;
+        }
+    }
+    if (ok) {
+        save_snap_cache(snaps);
+        std::lock_guard<std::mutex> l(g_mtx);
+        g_showing_cache = false;  // live data is about to land
+    }
     std::string active;
     {
         std::lock_guard<std::mutex> l(g_mtx);
@@ -954,9 +1017,15 @@ static void worker() {
     bool update_checked = false;
     if (g_standalone) load_snap_cache();  // paint the last session's data now
     while (g_run) {
-        if (g_standalone)
-            standalone_cycle();
-        else
+        if (g_standalone) {
+            // a manual refresh (g_busy) may already be mid-cycle: don't run a
+            // second concurrent sweep against the same tokens and cache file
+            if (!g_busy) {
+                g_busy = true;
+                standalone_cycle();
+                g_busy = false;
+            }
+        } else
             ingest(standalone::http_get_body(g_fetch_url));
         if (!update_checked) {
             update_checked = true;
