@@ -149,7 +149,8 @@ static const char* ESI = "https://esi.evetech.net/latest";
 // Overridable via config.json "scopes", e.g. to trim back to structures-only.
 static const char* SCOPE =
     "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
-    "esi-industry.read_corporation_mining.v1 esi-ui.write_waypoint.v1";
+    "esi-industry.read_corporation_mining.v1 esi-characters.read_notifications.v1 "
+    "esi-ui.write_waypoint.v1";
 static std::string g_scopes = SCOPE;
 // Refuel-history service: standalone clients have no storage, so each poll
 // reports its snapshot here and reads back the refuel log the server builds
@@ -923,8 +924,26 @@ static double fuel_per_day(const std::string& type_name, const json& services) {
 
 // --- the fetch: one corp's structures straight off ESI ------------------------
 // Returns /bpos-shaped JSON, or "" with err set (keeps the last table on screen).
+// pulls a "key: &anchor 12345" style value out of a notification's YAML text
+static long long yaml_ll(const std::string& text, const std::string& key) {
+    size_t p = text.find(key + ":");
+    if (p == std::string::npos) return 0;
+    p += key.size() + 1;
+    while (p < text.size() && (text[p] == ' ' || text[p] == '&')) {
+        if (text[p] == '&') {
+            while (p < text.size() && text[p] != ' ') p++;
+        } else {
+            p++;
+        }
+    }
+    long long v = 0;
+    while (p < text.size() && isdigit((unsigned char)text[p])) v = v * 10 + (text[p++] - '0');
+    return v;
+}
+
 static std::string fetch_corp(const std::string& tok, long long corp_id,
-                              const std::string& corp_display, std::string& err) try {
+                              const std::string& corp_display, long long char_id,
+                              std::string& err) try {
     int st = 0;
     json structures = json::array(), hdr = json::object();
     for (int page = 1, pages = 1; page <= pages && page <= 20; page++) {
@@ -1247,6 +1266,31 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             }
         } catch (...) { /* classification is best-effort */ }
     }
+    // structure notifications: a much faster signal than the hourly corp
+    // structures dataset (attacks land within ~10 min, plus anchoring and
+    // destruction events the list itself won't show until the next roll)
+    if (char_id && token_has_scope(tok, "esi-characters.read_notifications.v1")) {
+        int nst = 0;
+        std::string nb = http_get(ESI + std::string("/characters/") +
+                                      std::to_string(char_id) +
+                                      "/notifications/?datasource=tranquility",
+                                  tok, nst);
+        if (nst == 200) try {
+            json nj = json::parse(nb);
+            json outn = json::array();
+            for (auto& n : nj) {
+                std::string ty = n.value("type", "");
+                if (ty.rfind("Structure", 0) != 0) continue;
+                std::string text = n.value("text", "");
+                outn.push_back({{"type", ty},
+                                {"timestamp", n.value("timestamp", "")},
+                                {"structure_id", yaml_ll(text, "structureID")},
+                                {"system_id", yaml_ll(text, "solarsystemID")}});
+            }
+            out["notifications"] = outn;
+            out["notifications_ok"] = true;
+        } catch (...) {}
+    }
     return out.dump();
 } catch (...) {
     err = "unexpected error during the ESI pull";
@@ -1269,7 +1313,7 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
     std::string first_err;
     struct Job {
         std::string tok, label, corp_name;
-        long long corp_id = 0;
+        long long corp_id = 0, char_id = 0;
     };
     std::vector<Job> jobs;
     for (size_t i = 0; i < chars.size(); i++) {
@@ -1308,7 +1352,7 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
             label = !tick.empty() ? tick : (!nm.empty() ? nm : label);
             corp_name = nm;
         } catch (...) {}
-        jobs.push_back({tok, label, corp_name, corp_id});
+        jobs.push_back({tok, label, corp_name, corp_id, char_id});
     }
 
     // the heavy per-corp sweeps run in parallel: with two or more corps the
@@ -1321,7 +1365,8 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
             std::string err;
             std::string data =
                 fetch_corp(jobs[j].tok, jobs[j].corp_id,
-                           jobs[j].corp_name.empty() ? jobs[j].label : jobs[j].corp_name, err);
+                           jobs[j].corp_name.empty() ? jobs[j].label : jobs[j].corp_name,
+                           jobs[j].char_id, err);
             results[j] = {jobs[j].label, std::move(data)};
             errs[j] = err;
         });

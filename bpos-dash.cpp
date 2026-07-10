@@ -157,6 +157,17 @@ struct Refuel {
 
 static std::mutex g_mtx;
 static std::vector<Row> g_rows;
+
+// structure notifications (per active tab): a ~10-minute signal vs the hourly
+// structures dataset; drives early attack flashes, instant destroyed removal
+// and the "new structure anchoring" banner
+struct Notif {
+    std::string type;
+    time_t at = 0;
+    long long sid = 0;
+    long long system_id = 0;
+};
+static std::vector<Notif> g_notifs;
 static std::vector<Refuel> g_refuels;
 // standalone multi-corp: one cached snapshot per corp the logins can read;
 // the active one is what ingest() has parsed into the globals above. The tab
@@ -461,7 +472,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.4.5";
+static const char* STOKER_VERSION = "v2.5.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -801,9 +812,21 @@ static void ingest(const std::string& raw) {
                     if (r.bpd > 0) v.blocks = std::round(v.days_added * r.bpd);
                     break;
                 }
+    std::vector<Notif> notifs;
+    for (auto& e : d.value("notifications", json::array())) try {
+        Notif n;
+        n.type = e.value("type", "");
+        n.at = parse_iso(e.value("timestamp", ""));
+        if (e.contains("structure_id") && !e["structure_id"].is_null())
+            n.sid = e["structure_id"].get<long long>();
+        if (e.contains("system_id") && !e["system_id"].is_null())
+            n.system_id = e["system_id"].get<long long>();
+        notifs.push_back(std::move(n));
+    } catch (const std::exception&) {}
     std::lock_guard<std::mutex> l(g_mtx);
     g_rows = std::move(rows);
     g_refuels = std::move(refuels);
+    g_notifs = std::move(notifs);
     g_pulled_at = d.value("pulled_at", "");
     g_corp_name = d.value("corp", "");
     g_fuel2_status = d.value("fuel2_status", "");
