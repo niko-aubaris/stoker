@@ -12,6 +12,7 @@
 
 #include "font_dejavu_mono.hpp"
 #include "icons_data.hpp"
+#include "struct_icons_data.hpp"
 #include "window_icon_data.hpp"
 #include "jumpmap_data.hpp"
 #include "universe_pos.hpp"
@@ -243,17 +244,18 @@ static ImU32 ramp_u32(float t, bool secondary) {
 }
 
 // --- gl textures for the pixel-art icons --------------------------------------
-static ImTextureID make_icon(const unsigned char* rgba) {
+static ImTextureID make_icon(const unsigned char* rgba, int size = kIconSize,
+                             bool smooth = false) {
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kIconSize, kIconSize, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, rgba);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
     return (ImTextureID)(intptr_t)tex;
 }
 static ImTextureID g_ic_fuel, g_ic_gas, g_ic_ozone;
+static std::map<std::string, ImTextureID> g_type_icons;  // display type -> portrait
 
 // one half-height meter strip (small text riding inside)
 static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac,
@@ -637,6 +639,8 @@ int main(int argc, char** argv) {
     st.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.00f, 0.70f, 0.78f, 1);
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 130");
+    for (auto& e : kStructIcons)
+        g_type_icons[e.type] = make_icon(e.rgba, kStructIconSize, true);
     g_ic_fuel = make_icon(kIcon_fuel);
     g_ic_gas = make_icon(kIcon_gas);
     g_ic_ozone = make_icon(kIcon_ozone);
@@ -1122,7 +1126,19 @@ int main(int argc, char** argv) {
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
                 ImFont* fnt = ImGui::GetFont();
-                dl2->AddText(cp, ImGui::ColorConvertFloat4ToU32(TEXTC), r.name.c_str());
+                // structure-type portrait on the left edge; the text block
+                // indents past it (space reserved even without art so rows align)
+                float ix = rowh - 8 + 8;
+                {
+                    auto ti = g_type_icons.find(r.type);
+                    if (ti != g_type_icons.end())
+                        dl2->AddImageRounded(ti->second, ImVec2(cp.x, cp.y + 1),
+                                             ImVec2(cp.x + rowh - 8, cp.y + rowh - 7),
+                                             ImVec2(0, 0), ImVec2(1, 1),
+                                             IM_COL32(255, 255, 255, 255), 5.0f);
+                }
+                dl2->AddText(ImVec2(cp.x + ix, cp.y), ImGui::ColorConvertFloat4ToU32(TEXTC),
+                             r.name.c_str());
                 // under the name: the layer checklist (green = intact, red =
                 // stripped), with Timer and Moon Pull in a column next to it
                 {
@@ -1136,13 +1152,14 @@ int main(int argc, char** argv) {
                     const char* lbl[3] = {"Shield", "Armour", "Hull"};
                     for (int li = 0; li < 3; li++) {
                         float y = y0 + li * sp;
-                        dl2->AddCircleFilled(ImVec2(cp.x + 6, y + fs * 0.55f), 3.0f,
+                        dl2->AddCircleFilled(ImVec2(cp.x + ix + 6, y + fs * 0.55f), 3.0f,
                                              layers >= 3 - li ? IM_COL32(80, 230, 110, 255)
                                                               : IM_COL32(255, 70, 70, 255));
-                        dl2->AddText(fnt, fs, ImVec2(cp.x + 13, y),
+                        dl2->AddText(fnt, fs, ImVec2(cp.x + ix + 13, y),
                                      IM_COL32(200, 206, 222, 255), lbl[li]);
                     }
-                    float tx = cp.x + 13 + fnt->CalcTextSizeA(fs, 1e30f, 0, "Armour").x + 18;
+                    float tx =
+                        cp.x + ix + 13 + fnt->CalcTextSizeA(fs, 1e30f, 0, "Armour").x + 18;
                     (void)cw;
                     {
                         dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
@@ -1188,7 +1205,13 @@ int main(int argc, char** argv) {
                     ImGui::TextColored(GREY_, "select a structure");
                 } else {
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::Image(g_ic_fuel, ImVec2(24, 24));
+                    {
+                        auto ti = g_type_icons.find(d->type);
+                        if (ti != g_type_icons.end())
+                            ImGui::Image(ti->second, ImVec2(48, 48));
+                        else
+                            ImGui::Image(g_ic_fuel, ImVec2(24, 24));
+                    }
                     ImGui::SameLine();
                     ImGui::TextColored(CYAN_, "%s", d->name.c_str());
                     ImGui::TextColored(GREY_, "%s   %s   %s", d->system.c_str(),
