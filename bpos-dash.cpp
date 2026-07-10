@@ -459,7 +459,7 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.3.5";
+static const char* STOKER_VERSION = "v2.3.6";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static bool g_update_check = true;
 static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
@@ -810,10 +810,52 @@ static void ingest(const std::string& raw) {
         g_status = "";
 }
 
+// instant boot: the last good snapshot set is kept on disk and painted right
+// away while the real ESI sweep runs; the sweep replaces it when it lands
+static void save_snap_cache(const std::vector<standalone::Snap>& snaps) {
+    bool any = false;
+    for (auto& s : snaps) any = any || !s.label.empty();
+    if (!any) return;  // never cache the no-logins error placeholder
+    try {
+        json j = json::array();
+        for (auto& s : snaps) j.push_back({{"label", s.label}, {"data", s.data}});
+        std::ofstream f(standalone::config_dir() / "snap-cache.json",
+                        std::ios::binary | std::ios::trunc);
+        f << j.dump();
+    } catch (...) {}
+}
+
+static bool load_snap_cache() {
+    try {
+        json j = standalone::load_json_file(standalone::config_dir() / "snap-cache.json");
+        if (!j.is_array() || j.empty()) return false;
+        std::string active;
+        {
+            std::lock_guard<std::mutex> l(g_mtx);
+            g_tab_labels.clear();
+            g_tab_data.clear();
+            for (auto& e : j) {
+                g_tab_labels.push_back(e.value("label", ""));
+                g_tab_data.push_back(e.value("data", ""));
+            }
+            if (g_tab >= (int)g_tab_data.size()) g_tab = 0;
+            if (!g_tab_data.empty()) active = g_tab_data[g_tab];
+        }
+        if (active.empty()) return false;
+        ingest(active);
+        std::lock_guard<std::mutex> l(g_mtx);
+        g_status = "showing cached data - refreshing from ESI...";
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Pull every reachable corp, cache the snapshots for the tab bar, ingest the
 // active tab's. Used by both the poll loop and the manual refresh.
 static void standalone_cycle() {
     auto snaps = standalone::fetch_snapshots(g_client_id);
+    save_snap_cache(snaps);
     std::string active;
     {
         std::lock_guard<std::mutex> l(g_mtx);
@@ -831,6 +873,7 @@ static void standalone_cycle() {
 
 static void worker() {
     bool update_checked = false;
+    if (g_standalone) load_snap_cache();  // paint the last session's data now
     while (g_run) {
         if (g_standalone)
             standalone_cycle();

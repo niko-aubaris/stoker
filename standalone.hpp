@@ -1258,6 +1258,11 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
     json chars = load_characters();
     std::vector<long long> seen;
     std::string first_err;
+    struct Job {
+        std::string tok, label, corp_name;
+        long long corp_id = 0;
+    };
+    std::vector<Job> jobs;
     for (size_t i = 0; i < chars.size(); i++) {
         std::string tok = ensure_token_entry(client_id, chars, i);
         std::string who = chars[i].value("character_name", "?");
@@ -1294,14 +1299,31 @@ static std::vector<Snap> fetch_snapshots(const std::string& client_id) {
             label = !tick.empty() ? tick : (!nm.empty() ? nm : label);
             corp_name = nm;
         } catch (...) {}
+        jobs.push_back({tok, label, corp_name, corp_id});
+    }
 
-        std::string err;
-        std::string data = fetch_corp(tok, corp_id, corp_name.empty() ? label : corp_name, err);
-        if (data.empty()) {
-            if (first_err.empty() && !err.empty()) first_err = who + ": " + err;
+    // the heavy per-corp sweeps run in parallel: with two or more corps the
+    // boot takes as long as the slowest one instead of the sum
+    std::vector<Snap> results(jobs.size());
+    std::vector<std::string> errs(jobs.size());
+    std::vector<std::thread> ths;
+    for (size_t j = 0; j < jobs.size(); j++)
+        ths.emplace_back([&, j]() {
+            std::string err;
+            std::string data =
+                fetch_corp(jobs[j].tok, jobs[j].corp_id,
+                           jobs[j].corp_name.empty() ? jobs[j].label : jobs[j].corp_name, err);
+            results[j] = {jobs[j].label, std::move(data)};
+            errs[j] = err;
+        });
+    for (auto& t : ths) t.join();
+    for (size_t j = 0; j < jobs.size(); j++) {
+        if (results[j].data.empty()) {
+            if (first_err.empty() && !errs[j].empty())
+                first_err = jobs[j].label + ": " + errs[j];
             continue;
         }
-        out.push_back({label, std::move(data)});
+        out.push_back(std::move(results[j]));
     }
     if (out.empty()) {
         std::string msg = first_err.empty()
