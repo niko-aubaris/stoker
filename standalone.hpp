@@ -150,7 +150,11 @@ static const char* ESI = "https://esi.evetech.net/latest";
 static const char* SCOPE =
     "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
     "esi-industry.read_corporation_mining.v1 esi-characters.read_notifications.v1 "
-    "esi-ui.write_waypoint.v1";
+    "esi-structures.read_corporation.v1 esi-ui.write_waypoint.v1";
+
+// the new-generation ESI endpoints (skyhooks, sov hubs) only exist behind a
+// compatibility date; the legacy /latest tree does not carry them
+static const char* COMPAT_HDR = "X-Compatibility-Date: 2026-06-01";
 static std::string g_scopes = SCOPE;
 // Refuel-history service: standalone clients have no storage, so each poll
 // reports its snapshot here and reads back the refuel log the server builds
@@ -439,7 +443,8 @@ static std::string curl_error(const std::string& args) {
 
 // body-only GET for callers that don't care about the status code
 static std::string http_get(const std::string& url, const std::string& bearer,
-                            int& status, json* headers_out);
+                            int& status, json* headers_out = nullptr,
+                            const char* extra_hdr = nullptr);
 static std::string http_post_auth(const std::string& url, const std::string& bearer,
                                   int& status) {
     status = 0;
@@ -493,10 +498,14 @@ static std::string http_post_json(const std::string& url, const std::string& bod
 }
 
 // GET with response headers; returns body, fills status + wanted headers.
+// extra_hdr: one extra request header, e.g. the X-Compatibility-Date the
+// new-generation ESI endpoints require (curl path only; the Windows winhttp
+// fallback skips it and such calls degrade to an ESI error, handled upstream).
 static std::string http_get(const std::string& url, const std::string& bearer,
-                            int& status, json* headers_out = nullptr) {
+                            int& status, json* headers_out, const char* extra_hdr) {
     std::string args = "-i --compressed --max-time 30 ";
     if (!bearer.empty()) args += "-H \"Authorization: Bearer " + bearer + "\" ";
+    if (extra_hdr && *extra_hdr) args += "-H \"" + std::string(extra_hdr) + "\" ";
     args += "\"" + url + "\"";
     std::string raw = run_curl(args);
 #ifdef _WIN32
@@ -1293,6 +1302,77 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             if (kst == 200 && kj.contains("skyhooks") && kj["skyhooks"].is_array())
                 out["skyhooks"] = kj["skyhooks"];
         } catch (...) { /* best-effort */ }
+    }
+
+    // owner-level skyhook bays: reagent stocks (secured = reserve hold,
+    // unsecured = raidable bay), live theft window and real state, from the
+    // compat-dated corp skyhooks endpoint. Needs esi-structures.read_corporation.v1
+    // + Station_Manager. Merged into the watch-feed rows by planet id.
+    if (out.contains("skyhooks") &&
+        token_has_scope(tok, "esi-structures.read_corporation.v1")) {
+        try {
+            int sst = 0;
+            std::string base = std::string("https://esi.evetech.net/corporations/") +
+                               std::to_string(corp_id) + "/structures/skyhooks";
+            json lst = json::parse(http_get(base, tok, sst, nullptr, COMPAT_HDR));
+            if (sst == 200 && lst.contains("skyhooks") && lst["skyhooks"].is_array()) {
+                std::map<long long, json> by_planet;
+                for (auto& e : lst["skyhooks"]) {
+                    long long sk_id = e.value("id", 0LL);
+                    long long pid = e.value("planet_id", 0LL);
+                    if (!sk_id || !pid) continue;
+                    int dst = 0;
+                    try {
+                        json det = json::parse(http_get(base + "/" + std::to_string(sk_id),
+                                                        tok, dst, nullptr, COMPAT_HDR));
+                        if (dst == 200) by_planet[pid] = std::move(det);
+                    } catch (...) {}
+                }
+                // CamelCase enum -> the snake states the whole UI already knows
+                auto snake_state = [](const std::string& s) -> std::string {
+                    if (s == "ShieldVulnerable") return "shield_vulnerable";
+                    if (s == "ArmorReinforced") return "armor_reinforce";
+                    if (s == "ArmorVulnerable") return "armor_vulnerable";
+                    if (s == "HullReinforced") return "hull_reinforce";
+                    if (s == "HullVulnerable") return "hull_vulnerable";
+                    return "";
+                };
+                for (auto& row : out["skyhooks"]) {
+                    long long pid = row.value("planet_id", 0LL);
+                    auto it = by_planet.find(pid);
+                    if (it == by_planet.end()) continue;
+                    json& det = it->second;
+                    double um3 = 0, uisk = 0, sm3 = 0, sisk = 0;
+                    if (det.contains("reagents") && det["reagents"].is_array()) {
+                        std::lock_guard<std::mutex> vl(s_val_mtx);
+                        for (auto& rg : det["reagents"]) {
+                            long long tid = rg.value("type_id", 0LL);
+                            double un = rg.value("unsecured_stock", 0.0);
+                            double se = rg.value("secured_stock", 0.0);
+                            double vol = s_type.count(tid) ? s_type[tid].second : 0.01;
+                            double prc = s_price.count(tid) ? s_price[tid] : 0.0;
+                            um3 += un * vol;
+                            uisk += un * prc;
+                            sm3 += se * vol;
+                            sisk += se * prc;
+                        }
+                    }
+                    row["unsec_m3"] = um3;
+                    row["unsec_isk"] = uisk;
+                    row["sec_m3"] = sm3;
+                    row["sec_isk"] = sisk;
+                    if (det.contains("state") && det["state"].is_string())
+                        row["state"] = snake_state(det["state"].get<std::string>());
+                    if (det.contains("theft_vulnerability") &&
+                        det["theft_vulnerability"].is_object()) {
+                        row["window_start"] =
+                            det["theft_vulnerability"].value("start", "");
+                        row["window_end"] = det["theft_vulnerability"].value("end", "");
+                    }
+                    row["bays_ok"] = true;
+                }
+            }
+        } catch (...) { /* bays are best-effort; the watch feed still renders */ }
     }
 
     // structure notifications: a much faster signal than the hourly corp

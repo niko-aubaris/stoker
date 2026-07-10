@@ -476,9 +476,31 @@ static void dual_gauge(const Row& r, float w) {
     char b[32];
     std::snprintf(b, sizeof b, "%.1fd", r.days);
     ImTextureID ic2 = r.gas_day > 0 ? g_ic_gas : g_ic_ozone;
-    if (r.is_skyhook)  // skyhooks burn nothing: hatched NA across the board
-        mini_bar(dl, p, w, h, -1, "NA", "", false, 0);
-    else if (!r.has_fuel)
+    if (r.is_skyhook) {
+        // bar 1 = raidable surplus bay (what a thief gets, so fuller = redder),
+        // bar 2 = reserve hold, bar 3 = NA (skyhooks burn nothing)
+        ImVec2 p2(p.x, p.y + h + 2), p3(p.x, p.y + 2 * (h + 2));
+        if (r.sky_bays && r.sky_unsec_m3 >= 0) {
+            char pc[32];
+            std::snprintf(pc, sizeof pc, "%.0f%%",
+                          100.0 * r.sky_unsec_m3 / SKY_RAIDABLE_M3);
+            mini_bar(dl, p, w, h, r.sky_unsec_m3 / SKY_RAIDABLE_M3, pc,
+                     isk_compact(r.sky_unsec_isk < 0 ? 0 : r.sky_unsec_isk) + " isk", false,
+                     g_ic_gas, true);
+            char sc[32];
+            std::snprintf(sc, sizeof sc, "%.0f%%", 100.0 * r.sky_sec_m3 / SKY_RESERVE_M3);
+            mini_bar(dl, p2, w, h, r.sky_sec_m3 / SKY_RESERVE_M3, sc,
+                     isk_compact(r.sky_sec_isk < 0 ? 0 : r.sky_sec_isk) + " isk", true,
+                     g_ic_gas);
+        } else {  // no owner token: bays unreadable
+            mini_bar(dl, p, w, h, -1, "?", "", false, g_ic_gas);
+            mini_bar(dl, p2, w, h, -1, "?", "", true, g_ic_gas);
+        }
+        mini_bar(dl, p3, w, h, -1, "NA", "", false, 0);
+        ImGui::Dummy(ImVec2(w, gauge_cell_h(3)));
+        return;
+    }
+    if (!r.has_fuel)
         mini_bar(dl, p, w, h, -1, "--", "", false, g_ic_fuel);
     else
         mini_bar(dl, p, w, h, r.days / GAUGE_DAYS, b, to30(units_raw(r)), false, g_ic_fuel);
@@ -1398,10 +1420,7 @@ int main(int argc, char** argv) {
                         dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0), tc, tt.c_str());
                         dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
                                      "Income:");
-                        std::string inc =
-                            r.sky_hourly >= 0
-                                ? commas(r.sky_hourly) + "/h  " + commas(r.sky_rent) + "/mo rent"
-                                : "?";
+                        std::string inc = r.sky_hourly >= 0 ? commas(r.sky_hourly) + "/h" : "?";
                         dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
                                      IM_COL32(200, 206, 222, 255), inc.c_str());
                         if (open_) {
@@ -1533,10 +1552,20 @@ int main(int argc, char** argv) {
                                 ImGui::TextColored(GREY_, "Income:");
                                 ImGui::SameLine();
                                 ImGui::TextColored(TEXTC, "%s ISK/h", commas(d->sky_hourly).c_str());
-                                ImGui::TextColored(GREY_, "Rent:");
+                            }
+                            if (d->sky_bays && d->sky_unsec_m3 >= 0) {
+                                ImGui::TextColored(GREY_, "Raidable bay:");
                                 ImGui::SameLine();
-                                ImGui::TextColored(TEXTC, "%s ISK/mo",
-                                                   commas(d->sky_rent).c_str());
+                                ImGui::TextColored(TEXTC, "%s m3 / %s  (%s isk exposed)",
+                                                   commas(d->sky_unsec_m3).c_str(),
+                                                   commas(SKY_RAIDABLE_M3).c_str(),
+                                                   isk_compact(d->sky_unsec_isk).c_str());
+                                ImGui::TextColored(GREY_, "Reserve hold:");
+                                ImGui::SameLine();
+                                ImGui::TextColored(TEXTC, "%s m3 / %s  (%s isk banked)",
+                                                   commas(d->sky_sec_m3).c_str(),
+                                                   commas(SKY_RESERVE_M3).c_str(),
+                                                   isk_compact(d->sky_sec_isk).c_str());
                             }
                             if (d->sky_unraided >= 0)
                                 ImGui::TextColored(GREY_,
