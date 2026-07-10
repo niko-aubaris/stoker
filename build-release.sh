@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build the shippable STOKER packages into dist/:
-#   dist/stoker-windows-x64.zip      (static stoker.exe, no DLLs needed)
-#   dist/stoker-linux-x86_64.tar.gz  (static linux binary)
+# Build the shippable STOKER packages into dist/ (GUI ONLY since v2.6.2; the
+# TUI still builds for local use but is not distributed):
+#   dist/stoker-windows-x64.zip      (static stoker-gui.exe, no DLLs needed)
+#   dist/stoker-linux-x86_64.tar.gz  (static linux stoker-gui binary)
 # FTXUI v5.0.0 is fetched by CMake on first run. To reuse an already-fetched
 # copy: export FETCHCONTENT_SOURCE_DIR_FTXUI=/path/to/ftxui-src
 set -euo pipefail
@@ -21,6 +22,6 @@ cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw64.cmake "${EXTRA[
 cmake --build build-win -j"$(nproc)"
 
 mkdir -p dist
-tar -C build-linux -czf dist/stoker-linux-x86_64.tar.gz stoker stoker-gui
-( cd build-win && zip -q9 ../dist/stoker-windows-x64.zip stoker.exe stoker-gui.exe )
+tar -C build-linux -czf dist/stoker-linux-x86_64.tar.gz stoker-gui
+( cd build-win && zip -q9 ../dist/stoker-windows-x64.zip stoker-gui.exe )
 ls -lh dist/
