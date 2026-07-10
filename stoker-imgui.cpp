@@ -895,10 +895,14 @@ int main(int argc, char** argv) {
             if (mv.loading) ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1), "fetching DOTLAN layout...");
             else if (!mv.error.empty()) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", mv.error.c_str());
             else if (mv.ok) ImGui::TextColored(GREY_, "%s: %d systems - wheel zooms, drag pans, click selects", mv.region.c_str(), (int)mv.nodes.size());
-            if (g_logs_dir.empty())
+            if (g_eve_logs_cfg.empty())
                 ImGui::TextColored(GREY_,
-                                   "eve chat logs not found - set \"eve_logs\" in config.json "
-                                   "for the pilot/intel overlay");
+                                   "pilot/intel overlay is off - set \"eve_logs\": \"auto\" "
+                                   "(or a logs path) in config.json to enable");
+            else if (g_logs_dir.empty())
+                ImGui::TextColored(GREY_,
+                                   "eve chat logs not found - check the \"eve_logs\" path "
+                                   "in config.json");
 
             // structures per system for highlights + the side panel
             std::map<std::string, std::vector<const Row*>> by_sys;

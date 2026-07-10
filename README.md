@@ -61,12 +61,15 @@ then RESET when a new extraction needs scheduling. Moon pulls need the
 grant) plus the in-game Station Manager or Director role. Metenox rows also
 meter the moon material bay with its estimated market value.
 
-**Local awareness (GUI):** the map can overlay your pilots' positions and
-hostile intel by tailing the EVE client's own chat logs, SMT-style, no ESI
-involved. Auto-detects `Documents/EVE/logs`; set `"eve_logs"` in
-config.json for a custom path and `"intel_channels": ["..."]` to name
-intel channels explicitly (default: any channel with "intel" in its name).
-Intel systems ring red on the map and their fuel-table rows flag red.
+**Local awareness (GUI, opt-in):** the map can overlay your pilots'
+positions and hostile intel by tailing the EVE client's own chat logs,
+SMT-style, no ESI involved. Off by default (the log tailing costs
+filesystem work every couple of seconds, which some Windows setups feel):
+set `"eve_logs": "auto"` in config.json to enable with auto-detection of
+`Documents/EVE/logs`, or point it at a logs path directly. Optional
+`"intel_channels": ["..."]` names intel channels explicitly (default: any
+channel with "intel" or ".imperium" in its name). Intel systems ring red
+on the map and their fuel-table rows flag red.
 
 **Updates:** on startup STOKER checks the newest GitHub release once; if
 a newer version exists the header offers it and `u` downloads and swaps

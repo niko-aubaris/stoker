@@ -70,7 +70,8 @@ static std::string utf16le_to_utf8(const std::string& b) {
 static void logs_find_dir() {
     namespace fs = std::filesystem;
     std::vector<std::string> cands;
-    if (!g_eve_logs_cfg.empty()) cands.push_back(g_eve_logs_cfg);
+    if (!g_eve_logs_cfg.empty() && g_eve_logs_cfg != "auto")
+        cands.push_back(g_eve_logs_cfg);
 #ifdef _WIN32
     if (const char* up = std::getenv("USERPROFILE")) {
         cands.push_back(std::string(up) + "\\Documents\\EVE\\logs");
@@ -182,6 +183,11 @@ static bool is_intel_channel(const std::string& channel) {
 }
 
 static void eve_logs_scan() {
+    // OPT-IN: the tail runs on the render thread and the per-file stats are
+    // expensive on Windows (Defender intercepts every open), so the whole
+    // feature stays dormant unless config.json sets "eve_logs" ("auto" to
+    // auto-detect the client's logs dir, or an explicit path)
+    if (g_eve_logs_cfg.empty()) return;
     static time_t last_scan = 0, last_dirtry = 0, last_enum = 0;
     static std::vector<std::string> live;  // files worth tailing this session
     time_t nowt = time(nullptr);
