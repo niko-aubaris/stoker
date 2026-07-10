@@ -34,7 +34,8 @@ static std::map<int, std::vector<int>> g_adj;
 static std::map<int, std::string> g_sysname;
 static std::map<std::string, int> g_sysid;
 struct SysPos { double nx = 0, ny = 0; int region = 0; };
-static std::map<int, SysPos> g_syspos;  // whole-universe layout (SDE positions)
+static std::map<int, SysPos> g_syspos;  // whole-universe layout (eveterm's coords)
+static std::vector<std::pair<int, int>> g_jbridges;  // friendly Ansiblex network
 
 static void load_universe() {
     if (!g_adj.empty()) return;
@@ -57,6 +58,10 @@ static void load_universe() {
         for (auto& [k, v] : p.items())
             g_syspos[std::atoi(k.c_str())] = {v[0].get<double>(), v[1].get<double>(),
                                               v[2].get<int>()};
+    } catch (...) {}
+    try {
+        json b = json::parse(std::string(kJumpBridgesJson, kJumpBridgesSize));
+        for (auto& e : b) g_jbridges.push_back({e[0].get<int>(), e[1].get<int>()});
     } catch (...) {}
 }
 
@@ -836,6 +841,26 @@ int main(int argc, char** argv) {
                         (a.y > p0.y + sz.y && b.y > p0.y + sz.y))
                         continue;
                     dl->AddLine(a, b, IM_COL32(70, 74, 92, 255));
+                }
+                // friendly Ansiblex bridges: blue arcs over the gate lines,
+                // matching eveterm's map
+                if (!g_jbridges.empty()) {
+                    std::map<int, int> byid;
+                    for (int i = 0; i < (int)mv.nodes.size(); i++) byid[mv.nodes[i].id] = i;
+                    for (auto& jb : g_jbridges) {
+                        auto a = byid.find(jb.first), b = byid.find(jb.second);
+                        if (a == byid.end() || b == byid.end()) continue;
+                        ImVec2 pa = at(mv.nodes[a->second]), pb = at(mv.nodes[b->second]);
+                        if ((pa.x < p0.x && pb.x < p0.x) || (pa.y < p0.y && pb.y < p0.y) ||
+                            (pa.x > p0.x + sz.x && pb.x > p0.x + sz.x) ||
+                            (pa.y > p0.y + sz.y && pb.y > p0.y + sz.y))
+                            continue;
+                        ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
+                        ImVec2 d(pb.x - pa.x, pb.y - pa.y);
+                        dl->AddBezierQuadratic(pa,
+                                               ImVec2(mid.x - d.y * 0.18f, mid.y + d.x * 0.18f),
+                                               pb, IM_COL32(90, 175, 255, 220), 1.6f);
+                    }
                 }
                 int clicked = -1;
                 // on the universe map, labels only appear once zoomed in enough
