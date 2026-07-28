@@ -29,3 +29,12 @@ The C++ sources stay on this branch for reference; the Rust app lives in
 ## Build
     cargo build --release
     ./target/release/stoker
+
+## Design system (Rust GUI)
+- Type: Departure Mono (pixel display face: wordmark, labels, badges) +
+  JetBrains Mono (all data). All-mono on purpose; both OFL, embedded.
+- Palette: Hot Neon (pink #FF2BD6 / cyan #00E5FF on ink #0A0A10) with the
+  semantic urgency ramp red/orange/amber/teal, violet for secondary fuel.
+- Signature: the BURN LINE under the masthead - every fueled structure is
+  a tick on a 0-30d heat ruler, embers flicker under 3d, hover names a
+  tick, click selects it.

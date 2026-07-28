@@ -33,6 +33,53 @@ const BG_BAR: Color32 = Color32::from_rgb(16, 18, 26);
 const BG_ROW_SEL: Color32 = Color32::from_rgb(26, 30, 44);
 const BG_ROW_HOVER: Color32 = Color32::from_rgb(19, 22, 32);
 
+// type roles: Departure Mono (pixel grid) carries the console identity in
+// the wordmark, column heads, labels and badges; JetBrains Mono carries
+// every number and name. All-mono on purpose - this is an instrument.
+fn disp(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name("display".into()))
+}
+fn mono(size: f32) -> FontId {
+    FontId::monospace(size)
+}
+fn bold(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name("bold".into()))
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "departure".into(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/DepartureMono-Regular.otf")),
+    );
+    fonts.font_data.insert(
+        "jet".into(),
+        egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf"
+        )),
+    );
+    fonts.font_data.insert(
+        "jetbold".into(),
+        egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf"
+        )),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Proportional, vec!["jet".into(), "departure".into()]);
+    fonts
+        .families
+        .insert(egui::FontFamily::Monospace, vec!["jet".into()]);
+    fonts.families.insert(
+        egui::FontFamily::Name("display".into()),
+        vec!["departure".into()],
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("bold".into()), vec!["jetbold".into()]);
+    ctx.set_fonts(fonts);
+}
+
 fn band_color32(band: i32, secondary: bool) -> Color32 {
     match band {
         0 => RED,
@@ -129,13 +176,34 @@ const SORTS: [&str; 5] = ["fuel", "type", "system", "name", "need"];
 
 impl Gui {
     fn new(cc: &eframe::CreationContext<'_>, app: Arc<App>) -> Self {
+        setup_fonts(&cc.egui_ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG_PANEL;
         visuals.window_fill = BG;
         visuals.extreme_bg_color = BG_BAR;
         visuals.selection.bg_fill = NEON_DIM_CYAN;
         visuals.override_text_color = Some(LIGHT);
+        let edge = Stroke::new(1.0_f32, Color32::from_rgb(30, 34, 46));
+        for w in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.open,
+        ] {
+            w.rounding = Rounding::same(3.0);
+            w.weak_bg_fill = BG_BAR;
+            w.bg_stroke = edge;
+        }
+        visuals.widgets.hovered.rounding = Rounding::same(3.0);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(20, 24, 34);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, NEON_DIM_CYAN);
+        visuals.widgets.active.rounding = Rounding::same(3.0);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(24, 28, 40);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, NEON_CYAN);
         cc.egui_ctx.set_visuals(visuals);
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.button_padding = Vec2::new(10.0, 4.0);
+        cc.egui_ctx.set_style(style);
         let mut icons = HashMap::new();
         for (name, bytes) in ICONS {
             if let Some(img) = decode_png(bytes) {
@@ -436,56 +504,60 @@ impl eframe::App for Gui {
             rel_age(&g.pulled_at)
         };
 
-        // ---- header ----
+        // ---- masthead + burn line ----
         egui::TopBottomPanel::top("head").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("▌").color(NEON_PINK).size(18.0));
+                let (mark, _) = ui.allocate_exact_size(Vec2::new(8.0, 20.0), Sense::hover());
+                ui.painter().rect_filled(mark, Rounding::ZERO, NEON_PINK);
+                ui.label(egui::RichText::new("STOKER").font(disp(20.0)).color(NEON_PINK));
                 ui.label(
-                    egui::RichText::new("STOKER")
-                        .color(NEON_PINK)
-                        .strong()
-                        .size(18.0),
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .font(disp(9.0))
+                        .color(INK_GRAY),
                 );
-                ui.label(
-                    egui::RichText::new(format!("v{} ", env!("CARGO_PKG_VERSION")))
-                        .color(INK_GRAY)
-                        .size(11.0),
-                );
+                ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "» {}fuel watch",
+                        "{}FUEL WATCH",
                         if g.corp_name.is_empty() {
                             String::new()
                         } else {
-                            format!("{} ", g.corp_name)
+                            format!("{} · ", g.corp_name.to_uppercase())
                         }
                     ))
+                    .font(disp(11.0))
                     .color(NEON_DIM_CYAN),
                 );
-                ui.label(egui::RichText::new("[corp]").color(INK_GRAY).size(11.0));
                 ui.label(
-                    egui::RichText::new(format!("{}/{}", rows.len(), g.rows.len())).color(INK_GRAY),
+                    egui::RichText::new(" CORP FEED ")
+                        .font(disp(8.5))
+                        .color(INK_GRAY)
+                        .background_color(Color32::from_rgb(18, 20, 30)),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{}/{}", rows.len(), g.rows.len()))
+                        .font(mono(11.0))
+                        .color(INK_GRAY),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&fresh).color(INK_GRAY).size(11.0));
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(under7.to_string())
-                            .color(if under7 > 0 { RED } else { GREEN })
-                            .strong(),
-                    );
-                    ui.label(egui::RichText::new("under7d").color(INK_GRAY).size(11.0));
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(under14.to_string())
-                            .color(if under14 > 0 { YELLOW } else { GREEN })
-                            .strong(),
-                    );
-                    ui.label(egui::RichText::new("under14d").color(INK_GRAY).size(11.0));
+                    ui.label(egui::RichText::new(&fresh).font(mono(10.0)).color(INK_GRAY));
+                    ui.add_space(10.0);
+                    let chip = |ui: &mut egui::Ui, label: &str, n: i32, col: Color32| {
+                        ui.label(
+                            egui::RichText::new(format!(" {label} {n} "))
+                                .font(disp(10.0))
+                                .color(if n > 0 { col } else { GREEN })
+                                .background_color(Color32::from_rgb(18, 20, 30)),
+                        );
+                    };
+                    chip(ui, "<7D", under7, RED);
+                    chip(ui, "<14D", under14, YELLOW);
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            self.burn_line(ui, &g.rows, flash_on);
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Structures, "Structures");
                 ui.selectable_value(&mut self.tab, Tab::Refuels, "Refuel Log");
@@ -562,7 +634,7 @@ impl eframe::App for Gui {
                                 ui.image((tex.id(), Vec2::splat(48.0)));
                             }
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&d.name).color(NEON_PINK).strong());
+                                ui.label(egui::RichText::new(&d.name).color(NEON_PINK).font(bold(13.5)));
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new(&d.system).color(NEON_CYAN));
                                     ui.label(egui::RichText::new(if d.is_pos { &d.tower } else { &d.typ }).color(LIGHT));
@@ -585,10 +657,9 @@ impl eframe::App for Gui {
                                 ui.label(
                                     egui::RichText::new(format!("{k:>12}"))
                                         .color(NEON_DIM_CYAN)
-                                        .monospace()
-                                        .size(11.0),
+                                        .font(disp(9.5)),
                                 );
-                                ui.label(egui::RichText::new(v).color(c).size(12.0));
+                                ui.label(egui::RichText::new(v).color(c).font(mono(12.0)));
                             });
                         };
                         if d.has_fuel {
@@ -686,7 +757,14 @@ impl eframe::App for Gui {
                             kv(ui, "", txt, col);
                         }
                         ui.separator();
-                        if ui.button("I fueled this").clicked() {
+                        let claim_btn = egui::Button::new(
+                            egui::RichText::new("I FUELED THIS")
+                                .font(disp(10.0))
+                                .color(NEON_PINK),
+                        )
+                        .fill(Color32::from_rgb(40, 12, 34))
+                        .stroke(Stroke::new(1.0_f32, NEON_PINK.gamma_multiply(0.5)));
+                        if ui.add(claim_btn).clicked() {
                             let c = ctx.clone();
                             let seen = if self.tab == Tab::Refuels {
                                 self.sel_refuel
@@ -701,10 +779,9 @@ impl eframe::App for Gui {
                         }
                         ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new("REFUEL LOG  (this structure, newest first)")
+                            egui::RichText::new("REFUEL LOG · THIS STRUCTURE, NEWEST FIRST")
                                 .color(NEON_DIM_CYAN)
-                                .strong()
-                                .size(11.0),
+                                .font(disp(9.5)),
                         );
                         if d.log.is_empty() {
                             ui.label(egui::RichText::new("(no refuels seen yet)").color(GREY).size(11.0));
@@ -762,6 +839,99 @@ impl eframe::App for Gui {
 }
 
 impl Gui {
+    // THE BURN LINE: the whole corp on one 0-30d heat ruler. Every fueled
+    // structure is a tick at its usage-adjusted days left; ticks under 3d
+    // flicker like embers on the shared flash clock. Hover names a tick,
+    // click selects it in the table.
+    fn burn_line(&mut self, ui: &mut egui::Ui, rows: &[Row], flash_on: bool) {
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+        let p = ui.painter_at(rect);
+        let x0 = rect.min.x + 6.0;
+        let x1 = rect.max.x - 6.0;
+        let w = x1 - x0;
+        let base = rect.max.y - 12.0;
+        p.text(
+            Pos2::new(x0, rect.min.y + 2.0),
+            Align2::LEFT_TOP,
+            "BURN LINE",
+            disp(9.0),
+            NEON_DIM_CYAN,
+        );
+        p.text(
+            Pos2::new(x1, rect.min.y + 3.0),
+            Align2::RIGHT_TOP,
+            "EACH TICK = ONE STRUCTURE AT ITS DAYS OF FUEL",
+            disp(8.0),
+            Color32::from_rgb(60, 66, 82),
+        );
+        p.line_segment(
+            [Pos2::new(x0, base), Pos2::new(x1, base)],
+            Stroke::new(1.0_f32, Color32::from_rgb(30, 34, 46)),
+        );
+        let xat = |d: f64| x0 + w * (d.clamp(0.0, 30.0) / 30.0) as f32;
+        for (d, lab) in [(0.0, "0d"), (3.0, "3"), (7.0, "7"), (14.0, "14"), (30.0, "30d+")] {
+            let x = xat(d);
+            p.line_segment(
+                [Pos2::new(x, base), Pos2::new(x, base + 4.0)],
+                Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 68)),
+            );
+            // end labels hug inward so the panel edge can't clip them
+            let align = if d == 0.0 {
+                Align2::LEFT_TOP
+            } else if d == 30.0 {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::CENTER_TOP
+            };
+            p.text(Pos2::new(x, base + 5.0), align, lab, disp(8.0), INK_GRAY);
+        }
+        let hover = resp.hover_pos();
+        let mut near: Option<(f32, i64, String, f64)> = None;
+        for r in rows {
+            if !r.has_fuel || r.is_skyhook {
+                continue;
+            }
+            let d = effective_days(r);
+            let x = xat(d);
+            let mut col = days_color32(d);
+            let mut top = base - 14.0;
+            if d < 3.0 {
+                if flash_on {
+                    top = base - 18.0; // ember flare
+                } else {
+                    col = col.gamma_multiply(0.55);
+                }
+            }
+            if r.sid == self.sel_sid {
+                col = NEON_PINK;
+                top = base - 18.0;
+            }
+            p.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, base - 1.0)],
+                Stroke::new(2.0_f32, col),
+            );
+            if let Some(hp) = hover {
+                let dist = (hp.x - x).abs();
+                if dist < 5.0 && near.as_ref().map_or(true, |(bd, ..)| dist < *bd) {
+                    near = Some((dist, r.sid, format!("{}  {}", r.name, r.system), d));
+                }
+            }
+        }
+        if let Some((_, sid, label, d)) = near {
+            if resp.clicked() {
+                self.sel_sid = sid;
+            }
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), resp.id.with("bl"), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{label}   {d:.1}d"))
+                        .font(mono(11.0))
+                        .color(LIGHT),
+                );
+            });
+        }
+    }
+
     fn structures_table(&mut self, ui: &mut egui::Ui, rows: &[Row], notifs: &[Notif], flash_on: bool) {
         const ROW_H: f32 = 46.0;
         let w = ui.available_width();
@@ -776,8 +946,8 @@ impl Gui {
             let p = ui.painter();
             let y = ui.cursor().min.y + 8.0;
             let base = ui.cursor().min.x;
-            let font = FontId::monospace(11.0);
-            p.text(Pos2::new(base + x_meter, y), Align2::LEFT_CENTER, "FUEL / GAS-OZ (30d scale)", font.clone(), NEON_DIM_CYAN);
+            let font = disp(9.5);
+            p.text(Pos2::new(base + x_meter, y), Align2::LEFT_CENTER, "FUEL / GAS·OZ (30D)", font.clone(), NEON_DIM_CYAN);
             p.text(Pos2::new(base + x_type, y), Align2::LEFT_CENTER, "TYPE", font.clone(), NEON_DIM_CYAN);
             p.text(Pos2::new(base + x_sys, y), Align2::LEFT_CENTER, "SYSTEM", font.clone(), NEON_DIM_CYAN);
             p.text(Pos2::new(base + x_name, y), Align2::LEFT_CENTER, "NAME", font, NEON_DIM_CYAN);
@@ -803,6 +973,16 @@ impl Gui {
                         );
                     } else if resp.hovered() {
                         p.rect_filled(rect, Rounding::same(4.0), BG_ROW_HOVER);
+                    } else if i % 2 == 1 {
+                        p.rect_filled(rect, Rounding::ZERO, Color32::from_rgb(12, 13, 20));
+                    }
+                    // heat edge: anything under 3 days carries a red rim
+                    if r.has_fuel && r.days < 3.0 && r.sid != self.sel_sid {
+                        p.rect_filled(
+                            Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())),
+                            Rounding::ZERO,
+                            RED.gamma_multiply(0.7),
+                        );
                     }
                     // portrait
                     let icon_rect = Rect::from_min_size(
@@ -839,21 +1019,21 @@ impl Gui {
                         Pos2::new(rect.min.x + x_type, y1),
                         Align2::LEFT_CENTER,
                         &r.typ,
-                        FontId::proportional(13.0),
-                        LIGHT,
+                        mono(12.0),
+                        INK_GRAY,
                     );
                     p.text(
                         Pos2::new(rect.min.x + x_sys, y1),
                         Align2::LEFT_CENTER,
                         &r.system,
-                        FontId::monospace(13.0),
+                        mono(12.5),
                         NEON_CYAN,
                     );
                     p.text(
                         Pos2::new(rect.min.x + x_name, y1),
                         Align2::LEFT_CENTER,
                         &r.name,
-                        FontId::proportional(13.0),
+                        bold(13.0),
                         Color32::from_rgb(230, 234, 245),
                     );
                     let mut x = rect.min.x + x_name;
@@ -861,8 +1041,8 @@ impl Gui {
                         let painted = p.text(
                             Pos2::new(x, y2),
                             Align2::LEFT_CENTER,
-                            txt,
-                            FontId::proportional(10.5),
+                            txt.to_uppercase(),
+                            disp(8.5),
                             col,
                         );
                         x = painted.max.x + 10.0;
@@ -883,7 +1063,7 @@ impl Gui {
             let p = ui.painter();
             let y = ui.cursor().min.y + 8.0;
             let base = ui.cursor().min.x;
-            let font = FontId::monospace(11.0);
+            let font = disp(9.5);
             for (x, t) in [
                 (x_when, "WHEN"),
                 (x_days, "+DAYS"),
