@@ -1,0 +1,16 @@
+[package]
+name = "stoker"
+version = "2.11.0-rs"
+edition = "2021"
+description = "STOKER fuel-watch dashboard, Rust port (corp mode)"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde_json = "1.0"
+ureq = "2.10"
+
+[profile.release]
+lto = true
+strip = true
