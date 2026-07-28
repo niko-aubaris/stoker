@@ -844,25 +844,28 @@ impl Gui {
     // flicker like embers on the shared flash clock. Hover names a tick,
     // click selects it in the table.
     fn burn_line(&mut self, ui: &mut egui::Ui, rows: &[Row], flash_on: bool) {
+        const H: f32 = 84.0; // strip height
+        const LANES: usize = 4; // overlapping ticks stack instead of hiding
+        const LANE_H: f32 = 12.0;
         let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), H), Sense::click());
         let p = ui.painter_at(rect);
-        let x0 = rect.min.x + 6.0;
-        let x1 = rect.max.x - 6.0;
+        let x0 = rect.min.x + 8.0;
+        let x1 = rect.max.x - 8.0;
         let w = x1 - x0;
-        let base = rect.max.y - 12.0;
+        let base = rect.max.y - 16.0;
         p.text(
             Pos2::new(x0, rect.min.y + 2.0),
             Align2::LEFT_TOP,
             "BURN LINE",
-            disp(9.0),
+            disp(10.0),
             NEON_DIM_CYAN,
         );
         p.text(
             Pos2::new(x1, rect.min.y + 3.0),
             Align2::RIGHT_TOP,
-            "EACH TICK = ONE STRUCTURE AT ITS DAYS OF FUEL",
-            disp(8.0),
+            "EACH TICK = ONE STRUCTURE AT ITS DAYS OF FUEL · CLICK TO SELECT",
+            disp(8.5),
             Color32::from_rgb(60, 66, 82),
         );
         p.line_segment(
@@ -873,7 +876,7 @@ impl Gui {
         for (d, lab) in [(0.0, "0d"), (3.0, "3"), (7.0, "7"), (14.0, "14"), (30.0, "30d+")] {
             let x = xat(d);
             p.line_segment(
-                [Pos2::new(x, base), Pos2::new(x, base + 4.0)],
+                [Pos2::new(x, base), Pos2::new(x, base + 5.0)],
                 Stroke::new(1.0_f32, Color32::from_rgb(46, 52, 68)),
             );
             // end labels hug inward so the panel edge can't clip them
@@ -884,48 +887,86 @@ impl Gui {
             } else {
                 Align2::CENTER_TOP
             };
-            p.text(Pos2::new(x, base + 5.0), align, lab, disp(8.0), INK_GRAY);
+            p.text(Pos2::new(x, base + 6.0), align, lab, disp(9.0), INK_GRAY);
         }
-        let hover = resp.hover_pos();
-        let mut near: Option<(f32, i64, String, f64)> = None;
+        // lay ticks into lanes: same-x neighbours stack upward instead of
+        // painting over each other, so dense clusters stay clickable
+        struct Tick {
+            x: f32,
+            lane: usize,
+            sid: i64,
+            label: String,
+            days: f64,
+            col: Color32,
+        }
+        let mut lane_count: HashMap<i32, usize> = HashMap::new();
+        let mut ticks: Vec<Tick> = Vec::new();
         for r in rows {
             if !r.has_fuel || r.is_skyhook {
                 continue;
             }
             let d = effective_days(r);
             let x = xat(d);
+            let bucket = ((x - x0) / 5.0) as i32;
+            let n = lane_count.entry(bucket).or_insert(0);
+            let lane = (*n).min(LANES - 1);
+            *n += 1;
             let mut col = days_color32(d);
-            let mut top = base - 14.0;
-            if d < 3.0 {
-                if flash_on {
-                    top = base - 18.0; // ember flare
-                } else {
-                    col = col.gamma_multiply(0.55);
-                }
+            if d < 3.0 && !flash_on {
+                col = col.gamma_multiply(0.55); // ember dims between flares
             }
-            if r.sid == self.sel_sid {
-                col = NEON_PINK;
-                top = base - 18.0;
-            }
-            p.line_segment(
-                [Pos2::new(x, top), Pos2::new(x, base - 1.0)],
-                Stroke::new(2.0_f32, col),
-            );
+            ticks.push(Tick {
+                x,
+                lane,
+                sid: r.sid,
+                label: format!("{}  {}", r.name, r.system),
+                days: d,
+                col,
+            });
+        }
+        let hover = resp.hover_pos();
+        let mut near: Option<(f32, usize)> = None;
+        for (i, t) in ticks.iter().enumerate() {
             if let Some(hp) = hover {
-                let dist = (hp.x - x).abs();
-                if dist < 5.0 && near.as_ref().map_or(true, |(bd, ..)| dist < *bd) {
-                    near = Some((dist, r.sid, format!("{}  {}", r.name, r.system), d));
+                // aim by x, break ties by lane so stacked ticks stay reachable
+                let bot = base - 2.0 - t.lane as f32 * LANE_H;
+                let dx = (hp.x - t.x).abs();
+                let dy = (hp.y - (bot - LANE_H / 2.0)).abs().min(LANE_H);
+                let dist = dx * 2.0 + dy * 0.5;
+                if dx < 10.0 && near.as_ref().map_or(true, |(bd, _)| dist < *bd) {
+                    near = Some((dist, i));
                 }
             }
         }
-        if let Some((_, sid, label, d)) = near {
-            if resp.clicked() {
-                self.sel_sid = sid;
+        for (i, t) in ticks.iter().enumerate() {
+            let bot = base - 2.0 - t.lane as f32 * LANE_H;
+            let mut top = bot - (LANE_H - 2.0);
+            let mut col = t.col;
+            let mut width = 3.0_f32;
+            if t.sid == self.sel_sid {
+                col = NEON_PINK;
+                top -= 3.0;
+                width = 4.0;
             }
+            if near.map(|(_, ni)| ni) == Some(i) {
+                col = Color32::WHITE;
+                top -= 3.0;
+                width = 4.0;
+            } else if t.days < 3.0 && flash_on {
+                top -= 3.0; // ember flare
+            }
+            p.line_segment([Pos2::new(t.x, top), Pos2::new(t.x, bot)], Stroke::new(width, col));
+        }
+        if let Some((_, i)) = near {
+            let t = &ticks[i];
+            if resp.clicked() {
+                self.sel_sid = t.sid;
+            }
+            resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
             egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), resp.id.with("bl"), |ui| {
                 ui.label(
-                    egui::RichText::new(format!("{label}   {d:.1}d"))
-                        .font(mono(11.0))
+                    egui::RichText::new(format!("{}   {:.1}d", t.label, t.days))
+                        .font(mono(12.0))
                         .color(LIGHT),
                 );
             });
