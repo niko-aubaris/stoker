@@ -1,8 +1,8 @@
 // rendering: a span-for-span port of the FTXUI renderer in bpos-dash.cpp
 // onto ratatui Lines. One Paragraph inside a rounded border per frame.
 
-use crate::data::*;
-use crate::util::*;
+use stoker::data::*;
+use stoker::util::*;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use std::collections::HashSet;

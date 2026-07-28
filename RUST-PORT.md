@@ -7,13 +7,18 @@ The C++ sources stay on this branch for reference; the Rust app lives in
 ## What's ported
 - Corp mode (hosted BPOS endpoint, key-gated), reading the same
   `~/.config/stoker/config.json` / `STOKER_ENDPOINT` / `STOKER_KEY`
-- The full TUI: fuel/gas gauges, type filter, sort cycle, text filter,
-  tally marks, refuel log, structure detail page, refuel claims [1],
-  background 30s poll + [r] live-pull kick, `--dump` / `--version`
+- `stoker` (TUI, ratatui): fuel/gas gauges, type filter, sort cycle, text
+  filter, tally marks, refuel log, structure detail page, refuel claims
+  [1], background 30s poll + [r] live-pull kick, `--dump` / `--version`
+- `stoker-gui` (native window, egui): structure-portrait rows with
+  stacked fuel + gas/ozone meters, type/sort/text filters, state, power
+  badges (LOW FUEL / LOW POWER / OFFLINE / ABANDONED), UNDER ATTACK
+  flash, reinforcement/unanchor/moon-pull timers, detail side panel with
+  refuel log + one-click claims, Refuel Log tab, skyhook meters
 
 ## Not ported (yet)
 - Standalone EVE-SSO mode (PKCE login, direct ESI sweep, corp tabs)
-- The ImGui GUI build, jump map, intel overlay, splash
+- Jump map, chat-intel overlay, splash
 - Self-update ([u] shows a note; releases are still C++ builds)
 
 ## Differences by design

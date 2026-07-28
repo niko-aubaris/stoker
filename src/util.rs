@@ -79,6 +79,13 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 // days since the epoch for a civil date (Howard Hinnant's algorithm)
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

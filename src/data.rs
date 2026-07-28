@@ -208,7 +208,7 @@ pub struct Notif {
 }
 
 // everything the worker thread writes and the UI reads, one lock
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Shared {
     pub rows: Vec<Row>,
     pub refuels: Vec<Refuel>,
