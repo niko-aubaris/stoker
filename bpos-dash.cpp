@@ -572,7 +572,7 @@ static time_t parse_iso(const std::string& s) {
 // compromised GitHub account alone can't push code into running installs.
 // Rotating the key means shipping a new pubkey, which only helps people who
 // download that build manually: bake-and-forget, guard the private key.
-static const char* STOKER_VERSION = "v2.12.0";
+static const char* STOKER_VERSION = "v2.13.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
 static const char* UPDATE_PUBKEY_HEX =
     "dfe0ff016e3fc59710da2eedf057951c7878c5daff864361d3fa9de4de55d8f2";
@@ -1032,6 +1032,8 @@ static void ingest(const std::string& raw) {
         r.type = "Skyhook";
         std::string roman = sstr("planet_roman");
         r.name = r.system + (roman.empty() ? "" : " " + roman) + " Skyhook";
+        std::string kind = sstr("hook_kind");  // gas/ice, game-wide rows only
+        if (!kind.empty()) r.name += " (" + kind + ")";
         r.sky_hourly = snum("hourly_isk");
         r.sky_rent = snum("monthly_rent_isk");
         r.sky_streak = (int)snum("streak");
@@ -1317,6 +1319,11 @@ static bool load_or_setup(bool force_corp) {
         standalone::g_skyhooks_api = cfg["skyhooks_api"].get<std::string>();
     if (cfg.contains("skyhook_watchlist") && cfg["skyhook_watchlist"].is_array())
         standalone::g_skyhook_watchlist = cfg["skyhook_watchlist"];
+    // all game-wide windowed hooks ride along by default once a watchlist
+    // exists; "skyhook_all" in config forces it either way
+    standalone::g_skyhook_all = !standalone::g_skyhook_watchlist.empty();
+    if (cfg.contains("skyhook_all") && cfg["skyhook_all"].is_boolean())
+        standalone::g_skyhook_all = cfg["skyhook_all"].get<bool>();
     if (cfg.contains("econ_api") && cfg["econ_api"].is_string()) {
         standalone::g_econ_api = cfg["econ_api"].get<std::string>();
     } else if (!standalone::g_rentals_api.empty()) {

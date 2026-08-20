@@ -145,6 +145,12 @@ ESI raidable feed, no login or scopes needed: each hook shows a
 countdown when its next window is announced, an amber WINDOW SOON
 badge, and a flashing red RAIDABLE while the window is open.
 
+With a watchlist configured, every other skyhook in the game that has
+a window announced or open is listed too, tagged (gas)/(ice), sorted
+open-first then soonest. Set `"skyhook_all": false` to keep only your
+watchlist, or `"skyhook_all": true` to get the game-wide list with no
+watchlist at all.
+
 ### Corp mode
 
 If whoever hosts a STOKER backend gave you an endpoint URL and access key,

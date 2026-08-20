@@ -1697,8 +1697,26 @@ int main(int argc, char** argv) {
         }
         if (!note.empty()) {
             ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.51f, 1), "%s", note.c_str());
-        } else if (!status.empty()) {
-            ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1), "%s", status.c_str());
+        } else if (g_busy || !status.empty()) {
+            if (g_busy) {
+                // loading spinner: rotating cyan arc beside the status text;
+                // flash keeps frames coming so it actually spins
+                g_flash_active = true;
+                ImDrawList* sdl = ImGui::GetWindowDrawList();
+                ImVec2 c = ImGui::GetCursorScreenPos();
+                float rr = ImGui::GetTextLineHeight() * 0.40f;
+                ImVec2 ctr(c.x + rr + 2, c.y + rr + 3);
+                float a0 = (float)ImGui::GetTime() * 6.0f;
+                sdl->PathArcTo(ctr, rr, a0, a0 + 4.6f, 24);
+                sdl->PathStroke(IM_COL32(0, 230, 255, 255), 0, 2.2f);
+                ImGui::Dummy(ImVec2(2 * rr + 8, ImGui::GetTextLineHeight()));
+                ImGui::SameLine();
+            }
+            std::string prog = g_busy ? standalone::progress_now() : std::string();
+            std::string line = status;
+            if (!prog.empty()) line += (line.empty() ? "" : "  ") + prog;
+            if (line.empty()) line = "working...";
+            ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1), "%s", line.c_str());
         } else {
             ImGui::TextColored(GREY_, "%s", rows.empty() ? "loading..." : " ");
         }
@@ -2316,12 +2334,13 @@ int main(int argc, char** argv) {
             std::stable_sort(view.begin(), view.end(), [](const Row* a, const Row* b) {
                 auto worst = [](const Row* r) {
                     if (r->is_skyhook) {
-                        // own tab only: open windows first, then soonest to
-                        // open, windowless hooks at the bottom
+                        // own tab only: open windows first (soonest to close
+                        // on top), then soonest to open, windowless hooks last
                         time_t nowt = time(nullptr);
                         time_t ws = r->sky_wstart.empty() ? 0 : parse_iso(r->sky_wstart);
                         time_t we = r->sky_wend.empty() ? 0 : parse_iso(r->sky_wend);
-                        if (ws && we && nowt >= ws && nowt < we) return 0.0;
+                        if (ws && we && nowt >= ws && nowt < we)
+                            return -1e6 + (double)(we - nowt) / 86400.0;
                         if (ws && nowt < ws) return (double)(ws - nowt) / 86400.0;
                         return 1e9;
                     }
@@ -2488,11 +2507,13 @@ int main(int argc, char** argv) {
                         dl2->AddText(fnt, fs, ImVec2(tx, y0), IM_COL32(128, 136, 150, 255),
                                      "Window:");
                         dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0), tc, tt.c_str());
-                        dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
-                                     "Income:");
-                        std::string inc = r.sky_hourly >= 0 ? commas(r.sky_hourly) + "/h" : "?";
-                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
-                                     IM_COL32(200, 206, 222, 255), inc.c_str());
+                        if (r.sky_hourly >= 0) {  // income known only for watchlist hooks
+                            dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp),
+                                         IM_COL32(128, 136, 150, 255), "Income:");
+                            std::string inc = commas(r.sky_hourly) + "/h";
+                            dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
+                                         IM_COL32(200, 206, 222, 255), inc.c_str());
+                        }
                         if (open_) {  // the streak meter carries the count now
                             g_flash_active = true;
                             int wa = (int)(90 +

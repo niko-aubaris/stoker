@@ -188,6 +188,44 @@ static std::string g_skyhooks_api;
 // Theft windows come straight from the public raidable feed (no auth), so
 // this needs no server at all; takes precedence over "skyhooks_api".
 static json g_skyhook_watchlist = json::array();
+// config "skyhook_all": also list every hook game-wide that has a theft
+// window announced or open (the raidable feed only carries windowed hooks).
+// Defaults on when a watchlist is configured.
+static bool g_skyhook_all = false;
+
+// Live sweep progress: fetch stages stamp what they are pulling so the UI
+// can show a real loading state instead of a frozen "refreshing..." line.
+static std::mutex g_prog_mtx;
+static std::string g_progress;
+static void progress(const std::string& s) {
+    std::lock_guard<std::mutex> l(g_prog_mtx);
+    g_progress = s;
+}
+static std::string progress_now() {
+    std::lock_guard<std::mutex> l(g_prog_mtx);
+    return g_progress;
+}
+
+// Run fn(0..n-1) across a small worker pool. Each http_get is a whole curl
+// subprocess, so the per-item lookup loops (type names, moon names, tower
+// bays, skyhook planets) otherwise run one-at-a-time; ESI is fine with a
+// handful of concurrent pulls. Per-item exceptions are swallowed - callers
+// that need failure handling catch inside fn.
+static void parallel_for_n(size_t n, size_t workers,
+                           const std::function<void(size_t)>& fn) {
+    if (n == 0) return;
+    if (n == 1) { try { fn(0); } catch (...) {} return; }
+    std::atomic<size_t> next{0};
+    size_t w = workers < n ? workers : n;
+    std::vector<std::thread> ts;
+    for (size_t i = 0; i < w; i++)
+        ts.emplace_back([&] {
+            size_t k;
+            while ((k = next.fetch_add(1)) < n)
+                try { fn(k); } catch (...) {}
+        });
+    for (auto& t : ts) t.join();
+}
 
 // --- sha256 (for the PKCE code challenge) -----------------------------------
 struct Sha256 {
@@ -1062,14 +1100,16 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                               const std::string& corp_display, long long char_id,
                               std::string& err) try {
     int st = 0;
+    progress(corp_display + ": structures");
     json structures = json::array(), hdr = json::object();
-    for (int page = 1, pages = 1; page <= pages && page <= 20; page++) {
-        json* h = page == 1 ? &hdr : nullptr;
+    {
+        // page 1 sets the tone (auth errors, page count); the rest pull in
+        // parallel and ingest in order so multi-page corps stop paying
+        // one-curl-per-page wall clock
         std::string body = http_get(ESI + std::string("/corporations/") +
                                         std::to_string(corp_id) +
-                                        "/structures/?datasource=tranquility&page=" +
-                                        std::to_string(page),
-                                    tok, st, h);
+                                        "/structures/?datasource=tranquility&page=1",
+                                    tok, st, &hdr);
         if (st == 403) {
             err = "ESI 403: that character needs the Station_Manager "
                   "(or Director) in-game role";
@@ -1080,8 +1120,26 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         try { j = json::parse(body); } catch (...) { err = "ESI sent junk"; return ""; }
         if (!j.is_array()) { err = "ESI sent junk"; return ""; }
         for (auto& s : j) structures.push_back(s);
-        if (page == 1 && hdr.value("x-pages", std::string()) != "")
+        int pages = 1;
+        if (hdr.value("x-pages", std::string()) != "")
             pages = std::atoi(hdr["x-pages"].get<std::string>().c_str());
+        if (pages > 20) pages = 20;
+        if (pages > 1) {
+            std::vector<json> more((size_t)pages - 1);
+            parallel_for_n(more.size(), 6, [&](size_t i) {
+                int pst = 0;
+                std::string pb = http_get(ESI + std::string("/corporations/") +
+                                              std::to_string(corp_id) +
+                                              "/structures/?datasource=tranquility&page=" +
+                                              std::to_string((int)i + 2),
+                                          tok, pst);
+                if (pst == 200) more[i] = json::parse(pb);
+            });
+            for (auto& j2 : more) {
+                if (!j2.is_array()) { err = "ESI sent junk"; return ""; }
+                for (auto& s : j2) structures.push_back(s);
+            }
+        }
     }
 
     // resolve type + system ids in one public lookup
@@ -1120,20 +1178,9 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         if (g_scopes.find("read_corporation_assets") != std::string::npos)
             fuel2_status = "relogin";  // we ask for it now; this token predates that
     } else {
+        progress(corp_display + ": corp assets");
         json ahdr = json::object();
-        for (int page = 1, pages = 1; page <= pages && page <= 40; page++) {
-            json* h = page == 1 ? &ahdr : nullptr;
-            std::string body = http_get(ESI + std::string("/corporations/") +
-                                            std::to_string(corp_id) +
-                                            "/assets/?datasource=tranquility&page=" +
-                                            std::to_string(page),
-                                        tok, st, h);
-            if (st == 403) { fuel2_status = "director"; break; }
-            if (st != 200) { fuel2_status = "error"; break; }
-            json j;
-            try { j = json::parse(body); } catch (...) { break; }
-            if (!j.is_array()) break;
-            assets_ok = true;
+        auto ingest_assets = [&](json& j) {
             for (auto& it : j) {
                 std::string flag = it.value("location_flag", "");
                 long long loc = it.value("location_id", 0LL);
@@ -1150,8 +1197,49 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                     rig_at[loc] = tid;  // stretches the fire window + popped field life
                 }
             }
-            if (page == 1 && ahdr.value("x-pages", std::string()) != "")
-                pages = std::atoi(ahdr["x-pages"].get<std::string>().c_str());
+        };
+        // page 1 sequential (auth verdict + page count), the rest in parallel;
+        // a failed later page keeps the partial totals but flags "error" so
+        // the bars never silently undercount
+        std::string body = http_get(ESI + std::string("/corporations/") +
+                                        std::to_string(corp_id) +
+                                        "/assets/?datasource=tranquility&page=1",
+                                    tok, st, &ahdr);
+        if (st == 403) fuel2_status = "director";
+        else if (st != 200) fuel2_status = "error";
+        else {
+            json j;
+            bool ok1 = true;
+            try { j = json::parse(body); } catch (...) { ok1 = false; }
+            if (ok1 && j.is_array()) {
+                assets_ok = true;
+                ingest_assets(j);
+                int pages = 1;
+                if (ahdr.value("x-pages", std::string()) != "")
+                    pages = std::atoi(ahdr["x-pages"].get<std::string>().c_str());
+                if (pages > 40) pages = 40;
+                if (pages > 1) {
+                    std::vector<json> more((size_t)pages - 1);
+                    parallel_for_n(more.size(), 6, [&](size_t i) {
+                        int pst = 0;
+                        std::string pb = http_get(
+                            ESI + std::string("/corporations/") +
+                                std::to_string(corp_id) +
+                                "/assets/?datasource=tranquility&page=" +
+                                std::to_string((int)i + 2),
+                            tok, pst);
+                        if (pst == 200) more[i] = json::parse(pb);
+                    });
+                    for (auto& j2 : more) {
+                        if (j2.is_array()) ingest_assets(j2);
+                        else {
+                            // a page is missing: totals would undercount
+                            assets_ok = false;
+                            fuel2_status = "error";
+                        }
+                    }
+                }
+            }
         }
         if (assets_ok) fuel2_status = "ok";
     }
@@ -1170,6 +1258,20 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         std::vector<long long> missing;
         {
             std::lock_guard<std::mutex> vl(s_val_mtx);
+            // type names/volumes are static game data: seed from the disk
+            // cache once so a fresh boot doesn't redo dozens of lookups
+            static bool s_type_loaded = false;
+            if (!s_type_loaded) {
+                s_type_loaded = true;
+                json tc = load_json_file(config_dir() / "type-cache.json");
+                if (tc.is_object())
+                    for (auto it = tc.begin(); it != tc.end(); ++it)
+                        if (it.value().is_array() && it.value().size() == 2 &&
+                            it.value()[0].is_string() && it.value()[1].is_number())
+                            s_type[std::atoll(it.key().c_str())] = {
+                                it.value()[0].get<std::string>(),
+                                it.value()[1].get<double>()};
+            }
             if (time(nullptr) - s_price_at > 3600) {
                 s_price_at = time(nullptr);
                 need_prices = true;
@@ -1193,14 +1295,28 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 s_price[e.value("type_id", 0LL)] = ap;
             }
         } catch (...) { /* valuation is best-effort */ }
-        for (long long tid : missing) try {
+        if (!missing.empty())
+            progress(corp_display + ": type names (" + std::to_string(missing.size()) + ")");
+        parallel_for_n(missing.size(), 6, [&](size_t i) {
+            long long tid = missing[i];
+            // a failed pull keeps the placeholder (parallel_for_n eats throws)
             json tj = json::parse(http_get_body(ESI + std::string("/universe/types/") +
                                                 std::to_string(tid) +
                                                 "/?datasource=tranquility"));
             std::lock_guard<std::mutex> vl(s_val_mtx);
             s_type[tid] = {tj.value("name", "type " + std::to_string(tid)),
                            tj.value("volume", 0.0)};
-        } catch (...) { /* keep the placeholder */ }
+        });
+        if (!missing.empty()) {
+            json tc;
+            std::lock_guard<std::mutex> vl(s_val_mtx);
+            for (auto& t : s_type)
+                // skip unresolved "type NNNN" placeholders so they retry
+                if (t.second.first.rfind("type ", 0) != 0)
+                    tc[std::to_string(t.first)] =
+                        json::array({t.second.first, t.second.second});
+            save_json_file(config_dir() / "type-cache.json", tc);
+        }
     }
 
     // Athanor/Tatara moon-pull schedule. Needs esi-industry.read_corporation_mining.v1
@@ -1432,6 +1548,18 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             bool need_sov = false;
             {
                 std::lock_guard<std::mutex> pl(s_pos_mtx);
+                // moon names are static game data: seed from disk once
+                static bool s_moon_loaded = false;
+                if (!s_moon_loaded) {
+                    s_moon_loaded = true;
+                    json mc = load_json_file(config_dir() / "moon-names.json");
+                    if (mc.is_object())
+                        for (auto it = mc.begin(); it != mc.end(); ++it)
+                            if (it.value().is_string() &&
+                                !it.value().get<std::string>().empty())
+                                s_moon_name[std::atoll(it.key().c_str())] =
+                                    it.value().get<std::string>();
+                }
                 for (auto& t : towers) {
                     long long m = t.value("moon_id", 0LL);
                     if (m && !s_moon_name.count(m)) {
@@ -1444,18 +1572,30 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                     need_sov = true;
                 }
             }
-            for (long long m : want_moons) try {
-                json mj = json::parse(http_get_body(ESI + std::string("/universe/moons/") +
-                                                    std::to_string(m) +
-                                                    "/?datasource=tranquility"));
+            if (!want_moons.empty())
+                progress(corp_display + ": moon names (" + std::to_string(want_moons.size()) + ")");
+            parallel_for_n(want_moons.size(), 6, [&](size_t i) {
+                long long m = want_moons[i];
+                try {
+                    json mj = json::parse(http_get_body(
+                        ESI + std::string("/universe/moons/") + std::to_string(m) +
+                        "/?datasource=tranquility"));
+                    std::lock_guard<std::mutex> pl(s_pos_mtx);
+                    s_moon_name[m] = mj.value("name", "");
+                } catch (...) {
+                    // transient failure: drop our "" claim so the next sweep
+                    // retries, instead of caching the empty name for the process
+                    // lifetime. This round still falls back to "<system> POS".
+                    std::lock_guard<std::mutex> pl(s_pos_mtx);
+                    s_moon_name.erase(m);
+                }
+            });
+            if (!want_moons.empty()) {
+                json mc;
                 std::lock_guard<std::mutex> pl(s_pos_mtx);
-                s_moon_name[m] = mj.value("name", "");
-            } catch (...) {
-                // transient failure: drop our "" claim so the next sweep retries,
-                // instead of caching the empty name for the process lifetime.
-                // This round still falls back to "<system> POS" below.
-                std::lock_guard<std::mutex> pl(s_pos_mtx);
-                s_moon_name.erase(m);
+                for (auto& kv : s_moon_name)
+                    if (!kv.second.empty()) mc[std::to_string(kv.first)] = kv.second;
+                save_json_file(config_dir() / "moon-names.json", mc);
             }
             if (need_sov) try {
                 json sj = json::parse(http_get_body(
@@ -1489,7 +1629,24 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 std::lock_guard<std::mutex> pl(s_pos_mtx);
                 s_corp_ally[corp_id] = ally;
             }
-            for (auto& t : towers) {
+            // per-tower bay details prefetched in parallel: one call per tower,
+            // and the row loop below consumes the results by index
+            progress(corp_display + ": tower bays (" + std::to_string(towers.size()) + ")");
+            std::vector<json> tower_det(towers.size());
+            parallel_for_n(towers.size(), 6, [&](size_t i) {
+                long long sid = towers[i].value("starbase_id", 0LL);
+                long long sysid = towers[i].value("system_id", 0LL);
+                if (!sid) return;
+                int dst = 0;
+                json det = json::parse(http_get(
+                    ESI + std::string("/corporations/") + std::to_string(corp_id) +
+                        "/starbases/" + std::to_string(sid) +
+                        "/?datasource=tranquility&system_id=" + std::to_string(sysid),
+                    tok, dst));
+                if (dst == 200) tower_det[i] = std::move(det);
+            });
+            for (size_t ti = 0; ti < towers.size(); ti++) {
+                json& t = towers[ti];
                 long long sid = t.value("starbase_id", 0LL);
                 long long sysid = t.value("system_id", 0LL);
                 long long moonid = t.value("moon_id", 0LL);
@@ -1510,13 +1667,8 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 // the actual bay: fuel blocks + strontium from the tower detail
                 double blocks = -1, stront = -1;
                 try {
-                    int dst = 0;
-                    json det = json::parse(http_get(
-                        ESI + std::string("/corporations/") + std::to_string(corp_id) +
-                            "/starbases/" + std::to_string(sid) +
-                            "/?datasource=tranquility&system_id=" + std::to_string(sysid),
-                        tok, dst));
-                    if (dst == 200 && det.contains("fuels") && det["fuels"].is_array()) {
+                    json& det = tower_det[ti];
+                    if (det.contains("fuels") && det["fuels"].is_array()) {
                         // an empty fuels array is a real answer: the bay is empty
                         blocks = 0;
                         stront = 0;
@@ -1683,30 +1835,104 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     // from the public game-wide raidable feed (no auth), matched by planet id.
     // The compatibility date must ride as a query param - the header alone
     // 404s on the new-generation endpoints since ~Aug 2026.
-    if (corp_id == g_rentals_corp && !g_skyhook_watchlist.empty()) {
+    if (corp_id == g_rentals_corp &&
+        (!g_skyhook_watchlist.empty() || g_skyhook_all)) {
         json hooks = json::array();
+        std::map<long long, size_t> watch_at;
         for (auto& w : g_skyhook_watchlist)
-            if (w.is_object() && w.value("planet_id", 0LL)) hooks.push_back(w);
+            if (w.is_object() && w.value("planet_id", 0LL)) {
+                watch_at[w.value("planet_id", 0LL)] = hooks.size();
+                json h = w;
+                h["watch"] = true;
+                hooks.push_back(std::move(h));
+            }
         try {
+            progress("skyhook windows");  // game-wide, no corp label
             int rst = 0;
             json feed = json::parse(
                 http_get("https://esi.evetech.net/skyhooks/raidable"
                          "?compatibility_date=2026-06-01",
                          "", rst, nullptr, COMPAT_HDR));
-            if (rst == 200 && feed.contains("skyhooks") && feed["skyhooks"].is_array())
+            if (rst == 200 && feed.contains("skyhooks") && feed["skyhooks"].is_array()) {
+                // planet -> [name, type_id] cache; planets are static game
+                // data so each one is resolved once ever, persisted to disk
+                static std::mutex s_sky_mtx;
+                static json s_planets;
+                {
+                    std::lock_guard<std::mutex> sl(s_sky_mtx);
+                    static bool loaded = false;
+                    if (!loaded) {
+                        loaded = true;
+                        s_planets = load_json_file(config_dir() / "skyhook-planets.json");
+                    }
+                    if (!s_planets.is_object()) s_planets = json::object();
+                }
+                std::vector<long long> resolve;
+                std::vector<json> extra;
                 for (auto& e : feed["skyhooks"]) {
                     long long pid = e.value("planet_id", 0LL);
                     if (!pid || !e.contains("theft_vulnerability") ||
                         !e["theft_vulnerability"].is_object())
                         continue;
-                    for (auto& h : hooks)
-                        if (h.value("planet_id", 0LL) == pid) {
-                            h["window_start"] =
-                                e["theft_vulnerability"].value("start", "");
-                            h["window_end"] =
-                                e["theft_vulnerability"].value("end", "");
-                        }
+                    std::string ws = e["theft_vulnerability"].value("start", "");
+                    std::string we = e["theft_vulnerability"].value("end", "");
+                    auto wit = watch_at.find(pid);
+                    if (wit != watch_at.end()) {
+                        hooks[wit->second]["window_start"] = ws;
+                        hooks[wit->second]["window_end"] = we;
+                        continue;
+                    }
+                    if (!g_skyhook_all) continue;
+                    json h;
+                    h["planet_id"] = pid;
+                    h["window_start"] = ws;
+                    h["window_end"] = we;
+                    {
+                        std::lock_guard<std::mutex> sl(s_sky_mtx);
+                        if (!s_planets.contains(std::to_string(pid)))
+                            resolve.push_back(pid);
+                    }
+                    extra.push_back(std::move(h));
                 }
+                if (!resolve.empty()) {
+                    progress("skyhook planets (" + std::to_string(resolve.size()) + ")");
+                    parallel_for_n(resolve.size(), 6, [&](size_t i) {
+                        long long pid = resolve[i];
+                        json pj = json::parse(http_get_body(
+                            ESI + std::string("/universe/planets/") +
+                            std::to_string(pid) + "/?datasource=tranquility"));
+                        if (pj.contains("name") && pj["name"].is_string()) {
+                            std::lock_guard<std::mutex> sl(s_sky_mtx);
+                            s_planets[std::to_string(pid)] = json::array(
+                                {pj["name"].get<std::string>(), pj.value("type_id", 0LL)});
+                        }
+                    });
+                    std::lock_guard<std::mutex> sl(s_sky_mtx);
+                    save_json_file(config_dir() / "skyhook-planets.json", s_planets);
+                }
+                for (auto& h : extra) {
+                    std::string key = std::to_string(h.value("planet_id", 0LL));
+                    std::lock_guard<std::mutex> sl(s_sky_mtx);
+                    if (s_planets.contains(key) && s_planets[key].is_array() &&
+                        s_planets[key].size() == 2) {
+                        // planet name is "SYSTEM ROMAN"; sov-null system names
+                        // carry no spaces, so the last token is the planet
+                        std::string pn = s_planets[key][0].get<std::string>();
+                        size_t sp = pn.rfind(' ');
+                        h["system"] = sp == std::string::npos ? pn : pn.substr(0, sp);
+                        if (sp != std::string::npos)
+                            h["planet_roman"] = pn.substr(sp + 1);
+                        long long tid = s_planets[key][1].is_number()
+                                            ? s_planets[key][1].get<long long>()
+                                            : 0;
+                        if (tid == 2015) h["hook_kind"] = "gas";
+                        else if (tid == 12) h["hook_kind"] = "ice";
+                    } else {
+                        h["system"] = "?";
+                    }
+                    hooks.push_back(std::move(h));
+                }
+            }
         } catch (...) { /* windows are best-effort; the rows still render */ }
         out["skyhooks"] = std::move(hooks);
     } else if (corp_id == g_rentals_corp && !g_skyhooks_api.empty()) {
@@ -1826,6 +2052,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     // roll, and the actual chunk-fracture moment: MoonminingLaserFired names
     // who pressed the button, MoonminingAutomaticFracture is the 3h timeout)
     if (char_id && token_has_scope(tok, "esi-characters.read_notifications.v1")) {
+        progress(corp_display + ": notifications");
         int nst = 0;
         std::string nb = http_get(ESI + std::string("/characters/") +
                                       std::to_string(char_id) +
