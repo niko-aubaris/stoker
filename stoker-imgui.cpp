@@ -30,6 +30,7 @@ struct MapNode {
     int id = 0;
     std::string label, llabel;  // llabel: lowercased once at build time
     double nx = 0, ny = 0;
+    int region = 0;  // cross-region gates draw dashed (0 everywhere = all solid)
 };
 struct MapView {
     std::string region, error;
@@ -120,7 +121,8 @@ static void act_build_universe() {
             idx[kv.first] = (int)m.nodes.size();
             std::string nm = g_sysname.count(kv.first) ? g_sysname[kv.first]
                                                        : std::to_string(kv.first);
-            m.nodes.push_back({kv.first, nm, lower_(nm), kv.second.nx, kv.second.ny});
+            m.nodes.push_back(
+                {kv.first, nm, lower_(nm), kv.second.nx, kv.second.ny, kv.second.region});
         }
         for (auto& kv : idx)
             for (int nb : g_adj[kv.first])
@@ -150,7 +152,7 @@ static void map_center_on_system(MapView& live, int sysid) {
         }
     double span = std::max(x1 - x0, y1 - y0);
     live.pan = ImVec2((float)((x0 + x1) * 0.5), (float)((y0 + y1) * 0.5));
-    live.zoom = std::clamp((float)(0.85 / (span > 0.001 ? span : 0.001)), 1.0f, 80.0f);
+    live.zoom = std::clamp((float)(0.85 / (span > 0.001 ? span : 0.001)), 0.3f, 60.0f);
 }
 
 #include "eve_logs.hpp"
@@ -205,6 +207,42 @@ static void act_build_map(std::string region) {
 }
 
 // EVE autopilot: set the in-game destination with the first login that has
+// BFS jump counts from a source system over stargates + the friendly Ansiblex
+// network - the same graph eveterm routes on (a bridge is one jump). Cached
+// until the source changes; the whole of k-space is ~5,400 nodes.
+static const std::map<int, int>& jump_dists(int src) {
+    static std::map<int, int> dists;
+    static int cached_src = -1;
+    if (cached_src == src) return dists;
+    cached_src = src;
+    dists.clear();
+    std::map<int, std::vector<int>> bridge;
+    for (auto& jb : g_jbridges) {
+        bridge[jb.first].push_back(jb.second);
+        bridge[jb.second].push_back(jb.first);
+    }
+    std::deque<int> q{src};
+    dists[src] = 0;
+    while (!q.empty()) {
+        int s = q.front();
+        q.pop_front();
+        int d = dists[s];
+        auto push = [&](int n) {
+            if (!dists.count(n)) {
+                dists[n] = d + 1;
+                q.push_back(n);
+            }
+        };
+        auto it = g_adj.find(s);
+        if (it != g_adj.end())
+            for (int n : it->second) push(n);
+        auto bt = bridge.find(s);
+        if (bt != bridge.end())
+            for (int n : bt->second) push(n);
+    }
+    return dists;
+}
+
 // the waypoint scope (needs one re-login after v2.1 to grant it).
 static void act_set_destination(int system_id, const std::string& sysname) {
     spawn_bg([system_id, sysname]() {
@@ -287,20 +325,26 @@ static ImTextureID make_icon(const unsigned char* rgba, int size = kIconSize,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, smooth ? GL_LINEAR : GL_NEAREST);
     return (ImTextureID)(intptr_t)tex;
 }
-static ImTextureID g_ic_fuel, g_ic_gas, g_ic_ozone;
+static ImTextureID g_ic_fuel, g_ic_gas, g_ic_ozone, g_ic_goo;
 static std::map<std::string, ImTextureID> g_type_icons;  // display type -> portrait
+
+// POS rows all share the display type "POS" but wear their race's tower art
+static std::string icon_key(const Row& r) {
+    if (!r.is_pos) return r.type;
+    return "POS-" + (r.pos_race.empty() ? std::string("minmatar") : r.pos_race);
+}
 
 // one half-height meter strip (small text riding inside)
 static void mini_bar(ImDrawList* dl, ImVec2 p, float w, float h, double frac,
                      const std::string& left, const std::string& right, bool secondary,
-                     ImTextureID icon, bool invert = false) {
+                     ImTextureID icon, bool invert = false, ImU32 solid = 0) {
     ImU32 col = kGreyU32;
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 2.0f);
     float fillx = p.x;
     if (frac >= 0) {
         float f = frac > 1 ? 1.f : (float)frac;
         fillx = p.x + w * f;
-        col = ramp_u32(invert ? 1.0f - f : f, secondary);
+        col = solid ? solid : ramp_u32(invert ? 1.0f - f : f, secondary);
         dl->AddRectFilled(p, ImVec2(fillx, p.y + h), col, 2.0f);
     }
     if (frac < 0 && (left == "?" || left == "NA")) {  // unknown/absent: hatch the trough
@@ -456,8 +500,18 @@ static void skyhook_timer_info(const Row& r, std::string& txt, ImU32& col, bool&
     col = kGreyU32;
 }
 
-// Athanor/Tatara moon pull: countdown runs yellow -> green toward arrival
-// (the pull landing is good news), then POPPED for 24h, then RESET.
+// Athanor/Tatara moon pull, following the real chunk lifecycle: countdown
+// runs yellow -> green toward arrival (the pull landing is good news), then
+// READY while the chunk waits for someone to fire the laser (the timer only
+// starts the ~3h fire window - reaching 0 pops nothing by itself), then
+// POPPED once a MoonminingLaserFired/AutomaticFracture notification lands
+// (or natural_decay passes, the guaranteed auto-fracture), then RESET once
+// the asteroid field has decayed. natural_decay comes rig-adjusted straight
+// from ESI; the field lifetime is 48h base, stretched by the drilling rig.
+static time_t moonpull_field_life(const Row& r) {
+    double mult = r.drill_rig_tier == 2 ? 2.0 : r.drill_rig_tier == 1 ? 1.5 : 1.0;
+    return (time_t)(48 * 3600 * mult);
+}
 static void moonpull_info(const Row& r, bool extr_ok, std::string& txt, ImU32& col) {
     if (!extr_ok) {
         txt = "?";
@@ -478,13 +532,282 @@ static void moonpull_info(const Row& r, bool extr_ok, std::string& txt, ImU32& c
         frac = frac < 0 ? 0 : frac > 1 ? 1 : frac;
         txt = fmt_dur((double)(arr - nowt));
         col = mix_u32(IM_COL32(250, 215, 70, 255), IM_COL32(80, 230, 110, 255), (float)frac);
-    } else if (nowt - arr < 24 * 3600) {
+        return;
+    }
+    time_t decay = r.natural_decay.empty() ? 0 : parse_iso(r.natural_decay);
+    if (decay <= arr) decay = arr + 3 * 3600;  // old snapshots: unrigged window
+    // a pop notification from before this chunk arrived belongs to a past cycle
+    time_t popped = r.popped_at >= arr - 120 ? r.popped_at : 0;
+    if (!popped && nowt < decay) {
+        txt = "READY " + fmt_dur((double)(decay - nowt));  // time left to fire by hand
+        col = IM_COL32(255, 176, 60, 255);
+        return;
+    }
+    time_t pop_t = popped ? popped : decay;
+    if (nowt - pop_t < moonpull_field_life(r)) {
         txt = "POPPED";
         col = IM_COL32(80, 230, 110, 255);
     } else {
         txt = "RESET";
         col = IM_COL32(255, 70, 70, 255);
     }
+}
+
+// Metenox monthly profitability (goo - taxes - fuel - gas): text + colour +
+// flash tier shared by the fuel-panel NET label and the details equation.
+// green above 200m, yellow under it, red in the loss zone; the fuel panel
+// pulses yellow under 100m and red below zero.
+static std::string net_str(double v) {
+    return (v < 0 ? "-" : "") + isk_compact(std::fabs(v));
+}
+static ImU32 net_col(double v) {
+    if (v < 0) return IM_COL32(255, 70, 70, 255);
+    if (v < 200e6) return IM_COL32(250, 215, 70, 255);
+    return IM_COL32(80, 230, 110, 255);
+}
+
+// --- user preferences (settings window) --------------------------------------------
+// Fuel levels are per DISPLAY TYPE with optional per-structure overrides:
+// "alert" (days) feeds the needs-fuel filter, "cap" (days) is the bar's full
+// mark and the "[units] to [cap]d" haul target. Saved to prefs.json in the
+// config dir on every change.
+struct FuelPref {
+    float alert = 7, cap = 30;
+};
+enum : unsigned {
+    WF_ATTACK = 1, WF_ABANDONED = 2, WF_LOWPOWER = 4, WF_OFFLINE = 8,
+    WF_LOWFUEL = 16, WF_ANCHORING = 32, WF_UNANCHORING = 64, WF_TIMER = 128,
+    WF_MOONPULL = 256, WF_SKYWIN = 512,
+};
+static const struct { unsigned bit; const char* name; } kWarnDefs[] = {
+    {WF_ATTACK, "under attack"},   {WF_ABANDONED, "abandoned"},
+    {WF_LOWPOWER, "low power"},    {WF_OFFLINE, "services offline"},
+    {WF_LOWFUEL, "low fuel"},      {WF_ANCHORING, "anchoring/onlining"},
+    {WF_UNANCHORING, "unanchoring/unanchored"},
+    {WF_TIMER, "reinforce timer"}, {WF_MOONPULL, "moon pull attention"},
+    {WF_SKYWIN, "skyhook window"},
+};
+struct Prefs {
+    float goo_max_m3 = 50000;  // metenox bay bar reads full at this many m3
+    bool fuel_filter = false;  // toolbar: hide rows above their alert level
+    int warn_filter = 0;       // 0 = off (everything), 1 = flagged only
+    unsigned warn_mask = 0xFFFFFFFFu;  // which flags feed the warn filter
+    std::map<std::string, FuelPref> type_fuel, type_gas;
+    std::map<long long, FuelPref> sid_fuel, sid_gas;  // per-structure overrides
+    std::set<long long> hidden;  // manually hidden structures (settings unhides)
+};
+static Prefs g_prefs;
+
+// Slider edits mark this instead of writing prefs.json every frame of a drag;
+// the frame loop flushes it once no widget is active (i.e. on release).
+static bool g_prefs_dirty = false;
+
+static void prefs_save() {
+    json j;
+    j["goo_max_m3"] = g_prefs.goo_max_m3;
+    j["fuel_filter"] = g_prefs.fuel_filter;
+    j["warn_filter"] = g_prefs.warn_filter;
+    j["warn_mask"] = g_prefs.warn_mask;
+    auto put_type = [&](const char* key, std::map<std::string, FuelPref>& m) {
+        for (auto& kv : m)
+            j[key][kv.first] = {{"alert", kv.second.alert}, {"cap", kv.second.cap}};
+    };
+    auto put_sid = [&](const char* key, std::map<long long, FuelPref>& m) {
+        for (auto& kv : m)
+            j[key][std::to_string(kv.first)] = {{"alert", kv.second.alert},
+                                                {"cap", kv.second.cap}};
+    };
+    put_type("type_fuel", g_prefs.type_fuel);
+    put_type("type_gas", g_prefs.type_gas);
+    put_sid("sid_fuel", g_prefs.sid_fuel);
+    put_sid("sid_gas", g_prefs.sid_gas);
+    j["hidden"] = json::array();
+    for (auto sid : g_prefs.hidden) j["hidden"].push_back(sid);
+    standalone::save_json_file(standalone::config_dir() / "prefs.json", j);
+}
+
+static void prefs_load() {
+    json j = standalone::load_json_file(standalone::config_dir() / "prefs.json");
+    if (!j.is_object()) return;
+    g_prefs.goo_max_m3 = j.value("goo_max_m3", g_prefs.goo_max_m3);
+    g_prefs.fuel_filter = j.value("fuel_filter", g_prefs.fuel_filter);
+    g_prefs.warn_filter = j.value("warn_filter", g_prefs.warn_filter) ? 1 : 0;
+    g_prefs.warn_mask = j.value("warn_mask", g_prefs.warn_mask);
+    auto get_pref = [](const json& v) {
+        FuelPref p;
+        p.alert = v.value("alert", p.alert);
+        p.cap = v.value("cap", p.cap);
+        if (p.alert > 14) p.alert = 14;  // alert slider range is 0..14d
+        if (p.cap < 1) p.cap = 1;
+        return p;
+    };
+    if (j.contains("type_fuel"))
+        for (auto& [k, v] : j["type_fuel"].items()) g_prefs.type_fuel[k] = get_pref(v);
+    if (j.contains("type_gas"))
+        for (auto& [k, v] : j["type_gas"].items()) g_prefs.type_gas[k] = get_pref(v);
+    if (j.contains("sid_fuel"))
+        for (auto& [k, v] : j["sid_fuel"].items())
+            g_prefs.sid_fuel[std::atoll(k.c_str())] = get_pref(v);
+    if (j.contains("sid_gas"))
+        for (auto& [k, v] : j["sid_gas"].items())
+            g_prefs.sid_gas[std::atoll(k.c_str())] = get_pref(v);
+    if (j.contains("hidden") && j["hidden"].is_array())
+        for (auto& v : j["hidden"])
+            if (v.is_number()) g_prefs.hidden.insert(v.get<long long>());
+}
+
+// effective levels: structure override > type setting > defaults
+static FuelPref pref_fuel(const Row& r) {
+    auto s = g_prefs.sid_fuel.find(r.sid);
+    if (s != g_prefs.sid_fuel.end()) return s->second;
+    auto t = g_prefs.type_fuel.find(r.type);
+    if (t != g_prefs.type_fuel.end()) return t->second;
+    return FuelPref{};
+}
+static FuelPref pref_gas(const Row& r) {
+    auto s = g_prefs.sid_gas.find(r.sid);
+    if (s != g_prefs.sid_gas.end()) return s->second;
+    auto t = g_prefs.type_gas.find(r.type);
+    if (t != g_prefs.type_gas.end()) return t->second;
+    return FuelPref{};
+}
+
+// blocks needed to reach the cap; rate-based, falling back to the server's
+// 30d figure when the burn rate is unknown (only exact at cap 30 then)
+static double need_fuel_units(const Row& r, float cap) {
+    if (r.bpd > 0 && r.has_fuel) return std::max(0.0, std::round((cap - r.days) * r.bpd));
+    if ((int)cap == 30) return r.need;
+    return -1;
+}
+static double need_gas_units(const Row& r, float cap) {
+    if (r.gas_day <= 0 || r.fuel2 < 0) return -1;
+    return std::max(0.0, std::round((cap - fuel2_days(r)) * r.gas_day));
+}
+static std::string need_str(double units) {
+    return units < 0 ? "--" : units == 0 ? "ok" : commas(units);
+}
+// haul labels inside the bars read "[units] to [cap]d"
+static std::string to_cap(const std::string& s, float cap) {
+    if (s.empty() || s == "ok" || s == "--" || s == "?") return s;
+    char b[16];
+    std::snprintf(b, sizeof b, " to %.0fd", cap);
+    return s + b;
+}
+
+// every warning the row currently shows, as a mask (mirrors the badge logic
+// in the table renderer; feeds the warn filter)
+static unsigned row_flags(const Row& r, const std::set<long long>& attacked, bool extr_ok) {
+    if (r.is_skyhook) {
+        // a theft window announced (or open) is the only skyhook alarm
+        std::string tt;
+        ImU32 tc;
+        bool open = false;
+        skyhook_timer_info(r, tt, tc, open);
+        return (open || tt != "none") ? (unsigned)WF_SKYWIN : 0u;
+    }
+    unsigned fl = 0;
+    time_t nowt = time(nullptr);
+    time_t ua = r.unanchors_at.empty() ? 0 : parse_iso(r.unanchors_at);
+    bool limbo = r.state == "anchoring" || r.state == "anchor_vulnerable" ||
+                 r.state == "deploy_vulnerable" || r.state == "fitting_invulnerable" ||
+                 r.state == "onlining_vulnerable" || r.state == "unanchored";
+    if (attacked.count(r.sid) || r.state == "armor_reinforce" ||
+        r.state == "hull_reinforce" || r.state == "armor_vulnerable" ||
+        r.state == "hull_vulnerable" || r.state == "reinforced")
+        fl |= WF_ATTACK;
+    if (r.is_pos) {
+        // towers have their own power rules: offline = deliberately dark (no
+        // burn, no clock), online with an empty bay = the real emergency;
+        // onlining/unanchoring/reinforced carry state badges instead
+        if (r.state == "offline") fl |= WF_OFFLINE;
+        else if (r.state == "online" && r.has_fuel && r.days <= 0) fl |= WF_LOWPOWER;
+        else if (r.state == "online" && r.has_fuel && r.days < 7) fl |= WF_LOWFUEL;
+    } else if (!limbo) {
+        if (r.has_fuel && r.days <= -7) fl |= WF_ABANDONED;
+        else if (!r.has_fuel || r.days <= 0) fl |= WF_LOWPOWER;
+        else if (r.sv_on == 0 && r.sv_off > 0) fl |= WF_OFFLINE;
+        else if (r.days < 7) fl |= WF_LOWFUEL;
+    }
+    if (r.state == "anchoring" || r.state == "anchor_vulnerable" ||
+        r.state == "deploy_vulnerable" || r.state == "fitting_invulnerable" ||
+        r.state == "onlining_vulnerable")
+        fl |= WF_ANCHORING;
+    if (r.state == "unanchored" || ua > 0) fl |= WF_UNANCHORING;
+    {
+        std::string tt;
+        ImU32 tc;
+        timer_info(r, tt, tc);
+        if (tt != "NONE" && tt != "?") fl |= WF_TIMER;  // "NONE" is timer_info's idle text
+    }
+    if (has_moon_pull(r.type)) {
+        std::string mt;
+        ImU32 mc;
+        moonpull_info(r, extr_ok, mt, mc);
+        if (mt.rfind("READY", 0) == 0 || mt == "POPPED" || mt == "RESET")
+            fl |= WF_MOONPULL;
+    }
+    (void)nowt;
+    return fl;
+}
+
+// toolbar toggle: a real button with a bevel - popped out when off, pressed
+// in (dark well, sunken shadow, lit text) when on
+static bool toggle_btn(const char* label, bool on) {
+    ImGui::PushStyleColor(ImGuiCol_Button,
+                          on ? IM_COL32(16, 18, 28, 255) : IM_COL32(56, 58, 74, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          on ? IM_COL32(22, 26, 38, 255) : IM_COL32(68, 70, 88, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(14, 16, 24, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          on ? IM_COL32(0, 230, 255, 255) : IM_COL32(200, 206, 222, 255));
+    bool clicked = ImGui::SmallButton(label);
+    ImGui::PopStyleColor(4);
+    ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 lite = IM_COL32(255, 255, 255, 42), dark = IM_COL32(0, 0, 0, 170);
+    // bevel: light top/left = raised, dark top/left = sunken
+    dl->AddLine(ImVec2(mn.x, mn.y), ImVec2(mx.x - 1, mn.y), on ? dark : lite);
+    dl->AddLine(ImVec2(mn.x, mn.y), ImVec2(mn.x, mx.y - 1), on ? dark : lite);
+    dl->AddLine(ImVec2(mn.x, mx.y - 1), ImVec2(mx.x - 1, mx.y - 1), on ? lite : dark);
+    dl->AddLine(ImVec2(mx.x - 1, mn.y), ImVec2(mx.x - 1, mx.y - 1), on ? lite : dark);
+    return clicked;
+}
+
+// slider + digital dial readout: a real grab to drag, and beside it the value
+// in a dark well with glowing digits - click it and type to set exactly
+static bool dial_slider(const char* id, float* v, float mn, float mx, const char* fmt,
+                        float dial_w = 64.0f) {
+    bool ch = false;
+    ImGui::PushID(id);
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(std::max(40.0f, avail - dial_w - 6.0f));
+    ch |= ImGui::SliderFloat("##s", v, mn, mx, "");
+    {
+        // lit track: a thin cyan strip running from the left edge to the grab
+        ImVec2 smn = ImGui::GetItemRectMin(), smx = ImGui::GetItemRectMax();
+        float t = (mx > mn) ? (*v - mn) / (mx - mn) : 0.0f;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        float gw = ImGui::GetStyle().GrabMinSize;
+        float gx = smn.x + 3 + gw * 0.5f + t * (smx.x - smn.x - 6 - gw);
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(smn.x + 3, smx.y - 4),
+                                                  ImVec2(gx, smx.y - 2),
+                                                  IM_COL32(0, 200, 225, 140), 1.0f);
+    }
+    ImGui::SameLine(0, 4);
+    ImGui::SetNextItemWidth(dial_w);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(4, 8, 10, 255));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(8, 16, 20, 255));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(10, 22, 28, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 230, 255, 255));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 110, 125, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ch |= ImGui::InputFloat("##v", v, 0.0f, 0.0f, fmt);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(5);
+    ImGui::PopID();
+    if (*v < mn) *v = mn;
+    if (*v > mx) *v = mx;
+    return ch;
 }
 
 // both meters stacked in one cell: fuel blocks on top, gas/oz below
@@ -533,35 +856,68 @@ static void dual_gauge(const Row& r, float w) {
         ImGui::Dummy(ImVec2(w, gauge_cell_h(3)));
         return;
     }
-    if (!r.has_fuel)
+    float fcap = pref_fuel(r).cap;
+    if (!r.has_fuel && r.is_pos && r.blocks_now >= 0)
+        // parked tower: no clock, but the bay contents are real - show them
+        mini_bar(dl, p, w, h, -1, commas(r.blocks_now) + " blk stored", "", false,
+                 g_ic_fuel);
+    else if (!r.has_fuel)
         mini_bar(dl, p, w, h, -1, "--", "", false, g_ic_fuel);
     else
-        mini_bar(dl, p, w, h, r.days / GAUGE_DAYS, b, to30(units_raw(r)), false, g_ic_fuel);
+        mini_bar(dl, p, w, h, r.days / fcap, b,
+                 to_cap(need_str(need_fuel_units(r, fcap)), fcap), false, g_ic_fuel);
     ImVec2 p2(p.x, p.y + h + 2);
-    if (!has2) {  // type has no secondary fuel: hatched NA placeholder
+    if (r.is_pos) {
+        // POS second strip: the strontium bay, as hours of reinforcement it
+        // buys, metered against the longest timer a tower can hold (~41.7h)
+        if (r.stront_hours >= 0) {
+            char sl[32];
+            std::snprintf(sl, sizeof sl, "%.1fh", r.stront_hours);
+            mini_bar(dl, p2, w, h, r.stront_hours / POS_STRONT_MAX_H, sl,
+                     commas(r.stront) + " stront", true, 0);
+        } else {
+            mini_bar(dl, p2, w, h, -1, "?", "", true, 0);
+        }
+    } else if (!has2) {  // type has no secondary fuel: hatched NA placeholder
         mini_bar(dl, p2, w, h, -1, "NA", "", true, 0);
     } else if (r.fuel2 < 0) {
         mini_bar(dl, p2, w, h, -1, "?", "", true, ic2);
     } else if (r.gas_day > 0) {
+        float gcap = pref_gas(r).cap;
         char g[32];
         std::snprintf(g, sizeof g, "%.1fd", fuel2_days(r));
-        mini_bar(dl, p2, w, h, fuel2_days(r) / GAUGE_DAYS, g, to30(gas30_raw(r)), true, ic2);
+        mini_bar(dl, p2, w, h, fuel2_days(r) / gcap, g,
+                 to_cap(need_str(need_gas_units(r, gcap)), gcap), true, ic2);
     } else {
         mini_bar(dl, p2, w, h, r.lo_target > 0 ? r.fuel2 / r.lo_target : -1,
                  compact_units(r.fuel2), to30(gas30_raw(r)), true, ic2);
     }
     ImVec2 p3(p.x, p.y + 2 * (h + 2));
-    if (r.goo_cap > 0) {  // Metenox moongoo bay: fill % + haul value (inverted
-                          // ramp: a full bay is the one that needs emptying)
-        double gf = r.goo_m3 >= 0 ? r.goo_m3 / r.goo_cap : -1;
-        char pc[32];
-        std::snprintf(pc, sizeof pc, "%.0f%%", 100.0 * (gf < 0 ? 0 : gf));
-        mini_bar(dl, p3, w, h, gf, gf < 0 ? "?" : pc,
-                 isk_compact(r.goo_isk < 0 ? 0 : r.goo_isk) + " isk", false, g_ic_ozone, true);
+    if (r.goo_cap > 0) {
+        // Metenox moongoo bay: flat m3 stored + haul value, solid teal fill
+        // against the user's "bar max m3" setting (settings window)
+        double gf = r.goo_m3 >= 0
+                        ? std::min(1.0, r.goo_m3 / std::max(1.0f, g_prefs.goo_max_m3))
+                        : -1;
+        std::string gm3 = r.goo_m3 >= 0 ? commas(r.goo_m3) + " m3" : "?";
+        mini_bar(dl, p3, w, h, gf, gm3,
+                 isk_compact(r.goo_isk < 0 ? 0 : r.goo_isk) + " isk", false, g_ic_goo,
+                 false, IM_COL32(0, 130, 148, 255));
     } else if (r.type == "Metenox") {  // bay exists but this data source can't see it
-        mini_bar(dl, p3, w, h, -1, "?", "", false, g_ic_ozone);
+        mini_bar(dl, p3, w, h, -1, "?", "", false, g_ic_goo);
     } else {  // no moon material bay on this type: hatched NA placeholder
         mini_bar(dl, p3, w, h, -1, "NA", "", false, 0);
+    }
+    // profitability alarm: the whole fuel panel pulses red when the drill
+    // runs at a loss, yellow when the monthly net falls under 100m
+    if (r.has_econ && r.econ_net < 100e6) {
+        ImU32 warn = r.econ_net < 0 ? IM_COL32(255, 70, 70, 0)
+                                    : IM_COL32(250, 215, 70, 0);
+        g_flash_active = true;
+        int a = (int)(70 + 150 * (0.5 + 0.5 * std::sin(ImGui::GetTime() * 5.0)));
+        float ch = gauge_cell_h(3);
+        dl->AddRect(ImVec2(p.x - 2, p.y - 2), ImVec2(p.x + w + 2, p.y + ch + 1),
+                    warn | ((ImU32)a << 24), 4.0f, 0, 2.5f);
     }
     ImGui::Dummy(ImVec2(w, gauge_cell_h(3)));  // uniform rows: every type = Metenox height
 }
@@ -569,7 +925,7 @@ static void dual_gauge(const Row& r, float w) {
 // --- the gauge widget: fill fraction + text inside -----------------------------
 static void gauge(const char* id, double frac, const std::string& left,
                   const std::string& right, float w, bool secondary = false,
-                  ImTextureID icon = 0, bool invert = false) {
+                  ImTextureID icon = 0, bool invert = false, ImU32 solid = 0) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
     float h = ImGui::GetTextLineHeight() + 4;
@@ -577,7 +933,7 @@ static void gauge(const char* id, double frac, const std::string& left,
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(30, 32, 44, 255), 3.0f);
     if (frac >= 0) {
         float f = frac > 1 ? 1.f : (float)frac;
-        col = ramp_u32(invert ? 1.0f - f : f, secondary);
+        col = solid ? solid : ramp_u32(invert ? 1.0f - f : f, secondary);
         dl->AddRectFilled(p, ImVec2(p.x + w * f, p.y + h), col, 3.0f);
         dl->AddRect(p, ImVec2(p.x + w, p.y + h), (col & 0xFFFFFF) | 0x60000000, 3.0f);
     }
@@ -616,8 +972,8 @@ static void gauge(const char* id, double frac, const std::string& left,
 
 // --- background actions (mirrors of the TUI lambdas, on the shared core) ------
 static void act_refresh() {
-    if (g_busy) return;
-    g_busy = true;
+    bool f0 = false;
+    if (!g_busy.compare_exchange_strong(f0, true)) return;   // atomic claim, no TOCTOU
     {
         std::lock_guard<std::mutex> l(g_mtx);
         g_status = g_standalone ? "refreshing from ESI..." : "kicking a live ESI pull on the box...";
@@ -637,41 +993,76 @@ static void act_refresh() {
     });
 }
 
-static void act_add_character() {
-    if (!g_standalone) return;
-    if (g_busy) {  // a login (or refresh) is still in flight: say so instead
-                   // of silently eating the click - the SSO listener gives up
-                   // after 3 minutes and frees the busy flag
+// the SSO login flow; the caller has already claimed g_busy
+static void run_login_now() {
+    std::string err, name;
+    bool ok = standalone::login(g_client_id, err, &name, [](const std::string& s) {
         std::lock_guard<std::mutex> l(g_mtx);
-        g_note = "still waiting on the previous login/refresh (browser logins time "
-                 "out after 3 min) - try again shortly";
-        g_note_at = time(nullptr);
-        if (g_gui_wake) g_gui_wake();
-        return;
-    }
-    g_busy = true;
-    spawn_bg([]() {
-        std::string err, name;
-        bool ok = standalone::login(g_client_id, err, &name, [](const std::string& s) {
-            std::lock_guard<std::mutex> l(g_mtx);
-            g_status = s;
-            if (g_gui_wake) g_gui_wake();
-        });
-        {
-            std::lock_guard<std::mutex> l(g_mtx);
-            g_note = ok ? "added " + name : "login failed: " + err;
-            g_note_at = time(nullptr);
-            g_status.clear();
-        }
-        if (ok) standalone_cycle();
-        g_busy = false;
+        g_status = s;
         if (g_gui_wake) g_gui_wake();
     });
+    {
+        std::lock_guard<std::mutex> l(g_mtx);
+        // a cancelled login already announced its successor; stay quiet
+        if (ok || err != "cancelled") {
+            g_note = ok ? "added " + name : "login failed: " + err;
+            g_note_at = time(nullptr);
+        }
+        g_status.clear();
+    }
+    if (ok) standalone_cycle();
+    g_busy = false;
+    if (g_gui_wake) g_gui_wake();
+}
+
+static void act_add_character() {
+    if (!g_standalone) return;
+    bool f = false;
+    if (g_busy.compare_exchange_strong(f, true)) {
+        spawn_bg(run_login_now);
+        return;
+    }
+    if (standalone::login_pending()) {
+        // an abandoned browser login (tab closed, nothing picked) is holding
+        // the port: cancel it and start a fresh one the moment it lets go
+        static std::atomic<bool> s_takeover{false};
+        if (s_takeover.exchange(true)) return;  // restart already queued
+        {
+            std::lock_guard<std::mutex> l(g_mtx);
+            g_note = "previous login cancelled - opening a fresh EVE login...";
+            g_note_at = time(nullptr);
+            if (g_gui_wake) g_gui_wake();
+        }
+        standalone::cancel_pending_login();
+        spawn_bg([]() {
+            for (int i = 0; i < 100 && g_run; i++) {  // old listener exits within ~1s
+                bool ff = false;
+                if (g_busy.compare_exchange_strong(ff, true)) {
+                    s_takeover = false;
+                    run_login_now();
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            s_takeover = false;
+            std::lock_guard<std::mutex> l(g_mtx);
+            g_note = "could not take over the login - try again";
+            g_note_at = time(nullptr);
+            if (g_gui_wake) g_gui_wake();
+        });
+        return;
+    }
+    // a data refresh (not a login) holds the busy flag; those finish on their own
+    std::lock_guard<std::mutex> l(g_mtx);
+    g_note = "still busy with a data refresh - try again in a few seconds";
+    g_note_at = time(nullptr);
+    if (g_gui_wake) g_gui_wake();
 }
 
 static void act_claim(long long sid) {
-    if (g_busy || sid == 0 || g_standalone) return;
-    g_busy = true;
+    if (sid == 0 || g_standalone) return;
+    bool f0 = false;
+    if (!g_busy.compare_exchange_strong(f0, true)) return;   // atomic claim, no TOCTOU
     const char* env = std::getenv("STOKER_NAME");
     std::string who = (env && *env) ? env : "";
     spawn_bg([sid, who]() {
@@ -712,15 +1103,16 @@ static void act_check_update() {
     });
 }
 
-static void act_update(const std::string& tag, const std::string& url) {
-    if (g_busy) return;
-    g_busy = true;
+static void act_update(const std::string& tag, const std::string& url,
+                       const std::string& sig_url) {
+    bool f0 = false;
+    if (!g_busy.compare_exchange_strong(f0, true)) return;   // atomic claim, no TOCTOU
     {
         std::lock_guard<std::mutex> l(g_mtx);
         g_status = "downloading " + tag + "...";
     }
-    spawn_bg([tag, url]() {
-        std::string res = apply_update(tag, url);
+    spawn_bg([tag, url, sig_url]() {
+        std::string res = apply_update(tag, url, sig_url);
         {
             std::lock_guard<std::mutex> l(g_mtx);
             g_note = res;
@@ -731,6 +1123,269 @@ static void act_update(const std::string& tag, const std::string& url) {
         g_busy = false;
         if (g_gui_wake) g_gui_wake();
     });
+}
+
+// --- custom window chrome --------------------------------------------------------
+// The OS decorations are gone (GLFW_DECORATED false): STOKER draws its own Hot
+// Neon title bar (drag strip, min/max/close) and a cyan border, and implements
+// move + edge-resize by hand. Wayland forbids programmatic window moves, so it
+// keeps native decorations there; config "native_titlebar": true opts out too.
+static bool g_chrome = false;
+static bool g_win_maxed = false;
+static bool g_win_pinned = false;  // keep-on-top: floats over the EVE client
+static int g_win_rest[4];  // windowed pos+size to restore from maximize
+
+static const float CHROME_H = 30.0f;  // title-bar strip height
+static const float CHROME_BTN = 46.0f;
+
+static void chrome_toggle_max(GLFWwindow* win) {
+    if (g_win_maxed) {
+        // size FIRST: a window exactly filling the work area reads as
+        // "maximized" to some WMs (mutter), which ignore moves until the
+        // size shrinks away from that state
+        glfwSetWindowSize(win, g_win_rest[2], g_win_rest[3]);
+        glfwSetWindowPos(win, g_win_rest[0], g_win_rest[1]);
+        g_win_maxed = false;
+        return;
+    }
+    glfwGetWindowPos(win, &g_win_rest[0], &g_win_rest[1]);
+    glfwGetWindowSize(win, &g_win_rest[2], &g_win_rest[3]);
+    // maximize = fill the work area of the monitor holding the window centre
+    // (manual, so the taskbar/dock is respected on every platform)
+    int cx = g_win_rest[0] + g_win_rest[2] / 2, cy = g_win_rest[1] + g_win_rest[3] / 2;
+    int n = 0, wx = 0, wy = 0, ww = 0, wh = 0;
+    GLFWmonitor** mons = glfwGetMonitors(&n);
+    for (int i = 0; i < n; i++) {
+        int mx, my, mw, mh;
+        glfwGetMonitorWorkarea(mons[i], &mx, &my, &mw, &mh);
+        if (i == 0 || (cx >= mx && cx < mx + mw && cy >= my && cy < my + mh)) {
+            wx = mx;
+            wy = my;
+            ww = mw;
+            wh = mh;
+            if (i > 0) break;  // exact hit beats the primary fallback
+        }
+    }
+    if (ww > 0) {
+        glfwSetWindowPos(win, wx, wy);
+        glfwSetWindowSize(win, ww, wh);
+        g_win_maxed = true;
+    }
+}
+
+// "STOKER" as chunky 5x7 pixel letters with a pink->cyan sweep and a soft
+// glow; the embedded font is a plain mono, so the wordmark is drawn, not set
+static float chrome_wordmark(ImDrawList* dl, float x, float y) {
+    static const unsigned char L[6][7] = {
+        {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},  // S
+        {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},  // T
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},  // O
+        {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},  // K
+        {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},  // E
+        {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},  // R
+    };
+    const float px = 2.0f;
+    for (int li = 0; li < 6; li++) {
+        float f = li / 5.0f;  // pink -> cyan across the word
+        ImU32 c = IM_COL32((int)(255 * (1 - f)), (int)(43 + (230 - 43) * f),
+                           (int)(214 + (255 - 214) * f), 255);
+        ImU32 glow = (c & 0xFFFFFF) | (46u << 24);
+        float lx = x + li * (5 * px + 4);
+        for (int row = 0; row < 7; row++)
+            for (int col = 0; col < 5; col++)
+                if (L[li][row] & (0x10 >> col)) {
+                    float qx = lx + col * px, qy = y + row * px;
+                    dl->AddRectFilled(ImVec2(qx - 1, qy - 1), ImVec2(qx + px + 1, qy + px + 1),
+                                      glow);
+                    dl->AddRectFilled(ImVec2(qx, qy), ImVec2(qx + px, qy + px), c);
+                }
+    }
+    return x + 6 * (5 * px + 4);
+}
+
+static ImGuiMouseCursor chrome_cursor_for(int m) {
+    bool l = m & 1, r = m & 2, t = m & 4, b = m & 8;
+    if ((l && t) || (r && b)) return ImGuiMouseCursor_ResizeNWSE;
+    if ((r && t) || (l && b)) return ImGuiMouseCursor_ResizeNESW;
+    if (l || r) return ImGuiMouseCursor_ResizeEW;
+    return ImGuiMouseCursor_ResizeNS;
+}
+
+// title bar + border + resize. Called once per frame right after the main
+// window Begin; returns the strip height so content starts below it.
+static float chrome_begin(GLFWwindow* win) {
+    if (!g_chrome) return 0;
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float W = io.DisplaySize.x;
+
+    // strip + brand
+    dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, CHROME_H), IM_COL32(8, 8, 14, 255));
+    dl->AddLine(ImVec2(0, CHROME_H - 1), ImVec2(W, CHROME_H - 1), IM_COL32(0, 110, 125, 255));
+    dl->AddRectFilled(ImVec2(10, 7), ImVec2(14, CHROME_H - 7), IM_COL32(255, 43, 214, 255));
+    float wm_end = chrome_wordmark(dl, 20, 8);
+    dl->AddText(ImVec2(wm_end + 10, 6), IM_COL32(128, 136, 150, 255), STOKER_VERSION);
+
+    // buttons: pin (keep on top) / minimize / maximize / close
+    const char* ids[4] = {"##wpin", "##wmin", "##wmax", "##wclose"};
+    for (int i = 0; i < 4; i++) {
+        float bx = W - CHROME_BTN * (4 - i);
+        ImGui::SetCursorScreenPos(ImVec2(bx, 0));
+        ImGui::InvisibleButton(ids[i], ImVec2(CHROME_BTN, CHROME_H));
+        bool hov = ImGui::IsItemHovered();
+        if (hov)
+            dl->AddRectFilled(ImVec2(bx, 0), ImVec2(bx + CHROME_BTN, CHROME_H),
+                              i == 3 ? IM_COL32(200, 30, 55, 220) : IM_COL32(255, 255, 255, 22));
+        ImU32 gc = (hov && i == 3) ? IM_COL32(255, 255, 255, 255) : IM_COL32(200, 206, 222, 255);
+        float cx = bx + CHROME_BTN / 2, cy = CHROME_H / 2;
+        if (i == 0) {
+            // thumbtack: head + stem + point; cyan when pinned
+            ImU32 pc = g_win_pinned ? IM_COL32(0, 230, 255, 255) : gc;
+            if (g_win_pinned)
+                dl->AddRectFilled(ImVec2(bx, 0), ImVec2(bx + CHROME_BTN, CHROME_H),
+                                  IM_COL32(0, 140, 160, 40));
+            dl->AddCircleFilled(ImVec2(cx + 2, cy - 3), 3.5f, pc);
+            dl->AddLine(ImVec2(cx + 2, cy), ImVec2(cx + 2, cy + 2), pc, 2.0f);
+            dl->AddLine(ImVec2(cx - 2, cy + 6), ImVec2(cx + 1, cy + 3), pc, 1.0f);
+            if (hov)
+                ImGui::SetTooltip(g_win_pinned ? "release from top" : "keep on top of EVE");
+        } else if (i == 1) {
+            dl->AddLine(ImVec2(cx - 5, cy + 3), ImVec2(cx + 5, cy + 3), gc, 1.0f);
+        } else if (i == 2) {
+            if (g_win_maxed) {  // restore: two offset squares
+                dl->AddRect(ImVec2(cx - 2, cy - 5), ImVec2(cx + 5, cy + 2), gc);
+                dl->AddRectFilled(ImVec2(cx - 6, cy - 2), ImVec2(cx + 2, cy + 6),
+                                  IM_COL32(8, 8, 14, 255));
+                dl->AddRect(ImVec2(cx - 5, cy - 2), ImVec2(cx + 2, cy + 5), gc);
+            } else {
+                dl->AddRect(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), gc);
+            }
+        } else {
+            dl->AddLine(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), gc, 1.0f);
+            dl->AddLine(ImVec2(cx - 5, cy + 5), ImVec2(cx + 5, cy - 5), gc, 1.0f);
+        }
+        if (ImGui::IsItemClicked()) {
+            if (i == 0) {
+                g_win_pinned = !g_win_pinned;
+                glfwSetWindowAttrib(win, GLFW_FLOATING, g_win_pinned ? GLFW_TRUE : GLFW_FALSE);
+            } else if (i == 1) {
+                glfwIconifyWindow(win);
+            } else if (i == 2) {
+                chrome_toggle_max(win);
+            } else {
+                glfwSetWindowShouldClose(win, 1);
+            }
+        }
+    }
+
+    // drag strip: everything left of the buttons, below the 6px top resize zone
+    static bool dragging = false;
+    static double grab_x = 0, grab_y = 0;
+    ImGui::SetCursorScreenPos(ImVec2(0, 6));
+    ImGui::InvisibleButton("##wdrag", ImVec2(std::max(1.0f, W - CHROME_BTN * 4), CHROME_H - 6));
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+        dragging = false;
+        chrome_toggle_max(win);
+    } else {
+        if (ImGui::IsItemActivated()) {
+            if (g_win_maxed) {
+                // dragging a maximized window: restore it under the cursor at
+                // the same horizontal ratio, like the native titlebar does
+                double cx2, cy2;
+                glfwGetCursorPos(win, &cx2, &cy2);
+                int wx, wy;
+                glfwGetWindowPos(win, &wx, &wy);
+                double sx = wx + cx2, sy = wy + cy2;  // screen cursor
+                double ratio = W > 0 ? cx2 / W : 0.5;
+                chrome_toggle_max(win);
+                glfwSetWindowPos(win, (int)(sx - ratio * g_win_rest[2]), (int)(sy - 15));
+            }
+            glfwGetCursorPos(win, &grab_x, &grab_y);
+            dragging = true;
+        }
+        if (dragging && ImGui::IsItemActive()) {
+            double cx2, cy2;
+            glfwGetCursorPos(win, &cx2, &cy2);
+            int dx = (int)(cx2 - grab_x), dy = (int)(cy2 - grab_y);
+            if (dx || dy) {
+                int wx, wy;
+                glfwGetWindowPos(win, &wx, &wy);
+                glfwSetWindowPos(win, wx + dx, wy + dy);
+            }
+        } else if (!ImGui::IsItemActive()) {
+            dragging = false;
+        }
+    }
+
+    // version doubles as the update check; submitted after the drag strip so
+    // it wins the overlapping hover
+    ImGui::SetCursorScreenPos(ImVec2(wm_end + 8, 2));
+    if (ImGui::InvisibleButton("##wver", ImVec2(64, CHROME_H - 4))) act_check_update();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("check for updates");
+
+    // neon border (foreground list renders over everything)
+    ImGui::GetForegroundDrawList()->AddRect(ImVec2(0, 0), io.DisplaySize,
+                                            IM_COL32(0, 140, 160, 255));
+
+    // edge-resize state machine (raw io: the 6px zones live in the window
+    // padding where no widgets are; a started drag owns the gesture)
+    if (!g_win_maxed) {
+        static bool rz = false;
+        static int rz_edges = 0, rz_x, rz_y, rz_w, rz_h;
+        static double rz_cx, rz_cy;  // screen cursor at drag start
+        const float B = 6;
+        if (!rz) {
+            int m = 0;
+            ImVec2 mp = io.MousePos;
+            if (mp.x >= 0 && mp.y >= 0 && mp.x < W && mp.y < io.DisplaySize.y) {
+                if (mp.x < B) m |= 1;
+                if (mp.x >= W - B) m |= 2;
+                if (mp.y < B) m |= 4;
+                if (mp.y >= io.DisplaySize.y - B) m |= 8;
+            }
+            // the window buttons own the top-right corner
+            if ((m & 4) && mp.x > W - CHROME_BTN * 4) m = 0;
+            if (m && !ImGui::IsAnyItemActive() && !ImGui::IsAnyItemHovered()) {
+                ImGui::SetMouseCursor(chrome_cursor_for(m));
+                if (ImGui::IsMouseClicked(0)) {
+                    rz = true;
+                    rz_edges = m;
+                    glfwGetWindowPos(win, &rz_x, &rz_y);
+                    glfwGetWindowSize(win, &rz_w, &rz_h);
+                    double cx2, cy2;
+                    glfwGetCursorPos(win, &cx2, &cy2);
+                    rz_cx = rz_x + cx2;
+                    rz_cy = rz_y + cy2;
+                }
+            }
+        } else {
+            ImGui::SetMouseCursor(chrome_cursor_for(rz_edges));
+            if (!ImGui::IsMouseDown(0)) {
+                rz = false;
+            } else {
+                int wx, wy;
+                glfwGetWindowPos(win, &wx, &wy);
+                double cx2, cy2;
+                glfwGetCursorPos(win, &cx2, &cy2);
+                double dx = (wx + cx2) - rz_cx, dy = (wy + cy2) - rz_cy;
+                const int MINW = 780, MINH = 480;
+                int nx = rz_x, ny = rz_y, nw = rz_w, nh = rz_h;
+                if (rz_edges & 1) {
+                    nw = std::max(MINW, (int)(rz_w - dx));
+                    nx = rz_x + (rz_w - nw);
+                }
+                if (rz_edges & 2) nw = std::max(MINW, (int)(rz_w + dx));
+                if (rz_edges & 4) {
+                    nh = std::max(MINH, (int)(rz_h - dy));
+                    ny = rz_y + (rz_h - nh);
+                }
+                if (rz_edges & 8) nh = std::max(MINH, (int)(rz_h + dy));
+                if (nx != wx || ny != wy) glfwSetWindowPos(win, nx, ny);
+                glfwSetWindowSize(win, nw, nh);
+            }
+        }
+    }
+    return CHROME_H;
 }
 
 // --- main ----------------------------------------------------------------------
@@ -759,10 +1414,18 @@ int main(int argc, char** argv) {
     }
     const bool force_corp = argc > 1 && std::string(argv[1]) == "--corp";
     if (!load_or_setup(force_corp)) return 1;
+    prefs_load();
 
     if (!glfwInit()) return 1;
+    g_chrome = !g_native_titlebar;
+#if defined(GLFW_PLATFORM_WAYLAND)
+    // Wayland forbids programmatic window moves: keep native decorations there
+    if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) g_chrome = false;
+#endif
+    if (g_chrome) glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     GLFWwindow* win = glfwCreateWindow(1280, 820, "STOKER", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
+    glfwSetWindowSizeLimits(win, 780, 480, GLFW_DONT_CARE, GLFW_DONT_CARE);
     {
         GLFWimage ims[3] = {{64, 64, (unsigned char*)kWinIcon64},
                             {32, 32, (unsigned char*)kWinIcon32},
@@ -792,6 +1455,21 @@ int main(int argc, char** argv) {
     st.Colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.105f, 0.075f, 0.15f, 1);
     st.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.00f, 0.55f, 0.62f, 1);
     st.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.00f, 0.70f, 0.78f, 1);
+    // slider/button dress-up, adapted from the "enemymouse" neon-cyan style
+    // (dear-imgui-styles collection): chunky rounded grabs, translucent cyan
+    // that goes hot pink when grabbed, teal-tinted buttons, neon checkmarks
+    st.FrameRounding = 3.0f;
+    st.GrabRounding = 2.0f;
+    st.GrabMinSize = 16.0f;
+    st.Colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.10f, 0.17f, 1);
+    st.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.13f, 0.13f, 0.22f, 1);
+    st.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.16f, 0.15f, 0.26f, 1);
+    st.Colors[ImGuiCol_SliderGrab] = ImVec4(0.00f, 0.90f, 1.00f, 0.45f);
+    st.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.17f, 0.84f, 0.90f);
+    st.Colors[ImGuiCol_CheckMark] = ImVec4(0.00f, 0.90f, 1.00f, 0.80f);
+    st.Colors[ImGuiCol_Button] = ImVec4(0.00f, 0.35f, 0.40f, 0.55f);
+    st.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.00f, 0.55f, 0.62f, 0.70f);
+    st.Colors[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.75f, 0.85f, 0.85f);
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 130");
     for (auto& e : kStructIcons)
@@ -799,8 +1477,10 @@ int main(int argc, char** argv) {
     g_ic_fuel = make_icon(kIcon_fuel);
     g_ic_gas = make_icon(kIcon_gas);
     g_ic_ozone = make_icon(kIcon_ozone);
+    g_ic_goo = make_icon(kIcon_goo);
 
     std::thread th(worker);
+    std::thread logs_th(eve_logs_worker);  // SMT-style chat-log watcher
     if (g_standalone && !standalone::have_login()) act_add_character();
 
     char filter[128] = {0};
@@ -808,6 +1488,10 @@ int main(int argc, char** argv) {
     // rentals feed is online for the current tab
     static bool g_corp_only = true;
     static std::string g_type_tab;  // station-type tab; "" = All
+    // ctrl+click (toggle) / shift+click (range) haul tally: the detail panel
+    // becomes the hauling plan while anything is selected; skyhooks excluded
+    static std::set<long long> g_tally;
+    static long long g_tally_anchor = 0;
     long long detail_sid = 0;
     int view_tab = 0;  // 0 detail, 1 refuel log
 
@@ -826,9 +1510,10 @@ int main(int argc, char** argv) {
         static std::vector<std::string> tabs;
         static std::vector<Notif> notifs;
         static unsigned long long seen_gen = ~0ull;
-        std::string status, note, corpname, upd, updurl, pulled, esiMod;
+        std::string status, note, corpname, upd, updurl, updsig, pulled, esiMod;
         int tabsel;
         bool rentals_online, extractions_ok;
+        std::string pos_status;
         {
             std::lock_guard<std::mutex> l(g_mtx);
             if (seen_gen != g_data_gen) {
@@ -841,10 +1526,12 @@ int main(int argc, char** argv) {
             tabsel = g_tab;
             rentals_online = g_rentals_online;
             extractions_ok = g_extractions_ok;
+            pos_status = g_starbases_status;
             status = g_status;
             corpname = g_corp_name;
             upd = g_update_tag;
             updurl = g_update_url;
+            updsig = g_update_sig_url;
             esiMod = g_esi_lastmod;
             if (g_note_at && time(nullptr) - g_note_at < 20) note = g_note;
         }
@@ -856,12 +1543,18 @@ int main(int argc, char** argv) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                          ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        // header row; the version doubles as a check-for-updates button
-        ImGui::TextColored(PINK, "STOKER");
-        ImGui::SameLine();
-        if (ImGui::SmallButton(STOKER_VERSION)) act_check_update();
-        ImGui::SetItemTooltip("check for updates");
-        ImGui::SameLine();
+        float chrome_h = chrome_begin(win);
+        if (chrome_h > 0) ImGui::SetCursorPosY(chrome_h + 6);
+
+        // header row; with the custom chrome the brand + version live in the
+        // title bar, so only repeat them when the OS is drawing the window
+        if (!g_chrome) {
+            ImGui::TextColored(PINK, "STOKER");
+            ImGui::SameLine();
+            if (ImGui::SmallButton(STOKER_VERSION)) act_check_update();
+            ImGui::SetItemTooltip("check for updates");
+            ImGui::SameLine();
+        }
         ImGui::TextColored(DIMCYAN, " %s fuel watch",
                            corpname.empty() ? "..." : corpname.c_str());
         ImGui::SameLine();
@@ -872,16 +1565,135 @@ int main(int argc, char** argv) {
         if (!upd.empty()) {
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.42f, 0.05f, 1));
-            if (ImGui::SmallButton(("update " + upd).c_str())) act_update(upd, updurl);
+            if (ImGui::SmallButton(("update " + upd).c_str())) act_update(upd, updurl, updsig);
             ImGui::PopStyleColor();
         }
         ImGui::SameLine();
-        float rightw = g_standalone ? 250.0f : 160.0f;
+        static bool show_settings = false;
+        float rightw = (g_standalone ? 250.0f : 160.0f) + 80.0f;
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - rightw);
+        if (ImGui::SmallButton("settings")) show_settings = !show_settings;
+        ImGui::SameLine();
         if (ImGui::SmallButton("refresh")) act_refresh();
         if (g_standalone) {
             ImGui::SameLine();
             if (ImGui::SmallButton("+ add character")) act_add_character();
+        }
+
+        // settings: goo bar scale, per-type fuel levels, warning-flag set
+        if (show_settings) {
+            ImGui::SetNextWindowSize(ImVec2(740, 560), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("STOKER settings", &show_settings)) {
+                bool ch = false;
+                ImGui::TextColored(DIMCYAN, "metenox moon-material bar");
+                ImGui::TextColored(GREY_, "bar reads full at");
+                ImGui::SameLine();
+                {
+                    ImGui::PushID("goomax");
+                    ImGui::SetNextItemWidth(220);
+                    ch |= ImGui::SliderFloat("##s", &g_prefs.goo_max_m3, 1000.0f,
+                                             500000.0f, "", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SameLine(0, 4);
+                    ImGui::SetNextItemWidth(92);
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(4, 8, 10, 255));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(8, 16, 20, 255));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(10, 22, 28, 255));
+                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 230, 255, 255));
+                    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 110, 125, 255));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+                    ch |= ImGui::InputFloat("##v", &g_prefs.goo_max_m3, 0.0f, 0.0f,
+                                            "%.0f m3");
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(5);
+                    ImGui::PopID();
+                    if (g_prefs.goo_max_m3 < 1000) g_prefs.goo_max_m3 = 1000;
+                    if (g_prefs.goo_max_m3 > 500000) g_prefs.goo_max_m3 = 500000;
+                }
+                ImGui::Separator();
+                ImGui::TextColored(DIMCYAN, "fuel levels per structure type (days)");
+                ImGui::TextColored(GREY_,
+                                   "alert feeds the needs-fuel filter; max sets the bar "
+                                   "cap and the \"[units] to [max]d\" haul target");
+                std::set<std::string> stypes;
+                for (auto& r : rows)
+                    if (!r.is_skyhook && !r.type.empty()) stypes.insert(r.type);
+                for (auto& kv : g_prefs.type_fuel) stypes.insert(kv.first);
+                // fixed column widths: stretch-prop sizing feeds off content
+                // width while the sliders size off the column - a feedback loop
+                // that visibly "walks" for a few frames after every resize
+                if (ImGui::BeginTable("fuelprefs", 5, ImGuiTableFlags_BordersInnerH)) {
+                    ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("fuel alert", ImGuiTableColumnFlags_WidthFixed, 128);
+                    ImGui::TableSetupColumn("fuel max", ImGuiTableColumnFlags_WidthFixed, 128);
+                    ImGui::TableSetupColumn("gas alert", ImGuiTableColumnFlags_WidthFixed, 128);
+                    ImGui::TableSetupColumn("gas max", ImGuiTableColumnFlags_WidthFixed, 128);
+                    ImGui::TableHeadersRow();
+                    for (auto& t : stypes) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextColored(TEXTC, "%s", t.c_str());
+                        ImGui::PushID(t.c_str());
+                        FuelPref& fp = g_prefs.type_fuel[t];
+                        ImGui::TableSetColumnIndex(1);
+                        ch |= dial_slider("fa", &fp.alert, 0.0f, 14.0f, "%.0f d", 52.0f);
+                        ImGui::TableSetColumnIndex(2);
+                        ch |= dial_slider("fc", &fp.cap, 1.0f, 90.0f, "%.0f d", 52.0f);
+                        if (t == "Metenox") {  // the only type with a days-based 2nd bar
+                            FuelPref& gp = g_prefs.type_gas[t];
+                            ImGui::TableSetColumnIndex(3);
+                            ch |= dial_slider("ga", &gp.alert, 0.0f, 14.0f, "%.0f d", 52.0f);
+                            ImGui::TableSetColumnIndex(4);
+                            ch |= dial_slider("gc", &gp.cap, 1.0f, 90.0f, "%.0f d", 52.0f);
+                        } else {
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::TextColored(GREY_, "-");
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::TextColored(GREY_,
+                                   "each structure's detail panel can override these "
+                                   "per structure");
+                ImGui::Separator();
+                ImGui::TextColored(DIMCYAN, "hidden structures");
+                if (g_prefs.hidden.empty()) {
+                    ImGui::TextColored(GREY_,
+                                       "none - hide one from its detail settings popup");
+                } else {
+                    std::vector<long long> unhide;
+                    for (auto sid : g_prefs.hidden) {
+                        const Row* hr = nullptr;
+                        for (auto& r : rows)
+                            if (r.sid == sid) { hr = &r; break; }
+                        ImGui::PushID((int)(sid & 0x7fffffff));
+                        if (ImGui::SmallButton("unhide")) unhide.push_back(sid);
+                        ImGui::PopID();
+                        ImGui::SameLine();
+                        if (hr)
+                            ImGui::TextColored(TEXTC, "%s  (%s)", hr->name.c_str(),
+                                               hr->system.c_str());
+                        else
+                            ImGui::TextColored(GREY_, "structure %lld (another corp tab)",
+                                               sid);
+                    }
+                    if (g_prefs.hidden.size() > 1 && ImGui::SmallButton("unhide all"))
+                        g_prefs.hidden.clear(), ch = true;
+                    for (auto sid : unhide) {
+                        g_prefs.hidden.erase(sid);
+                        ch = true;
+                    }
+                }
+                ImGui::Separator();
+                ImGui::TextColored(DIMCYAN, "warning flags counted by the flags filter");
+                int wi = 0;
+                for (auto& wd : kWarnDefs) {
+                    if (wi++ % 2) ImGui::SameLine(280.0f);
+                    ch |= ImGui::CheckboxFlags(wd.name, &g_prefs.warn_mask, wd.bit);
+                }
+                if (ch) g_prefs_dirty = true;   // flushed on release, not per drag frame
+            }
+            ImGui::End();
         }
         if (!note.empty()) {
             ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.51f, 1), "%s", note.c_str());
@@ -977,14 +1789,14 @@ int main(int argc, char** argv) {
             if (mv.loading) ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.27f, 1), "fetching DOTLAN layout...");
             else if (!mv.error.empty()) ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "%s", mv.error.c_str());
             else if (mv.ok) ImGui::TextColored(GREY_, "%s: %d systems - wheel zooms, drag pans, click selects", mv.region.c_str(), (int)mv.nodes.size());
-            if (g_eve_logs_cfg.empty())
+            if (lower_(g_eve_logs_cfg) == "off")
                 ImGui::TextColored(GREY_,
-                                   "pilot/intel overlay is off - set \"eve_logs\": \"auto\" "
-                                   "(or a logs path) in config.json to enable");
-            else if (g_logs_dir.empty())
+                                   "pilot/intel overlay disabled (\"eve_logs\": \"off\" "
+                                   "in config.json)");
+            else if (g_logs_found < 0)
                 ImGui::TextColored(GREY_,
-                                   "eve chat logs not found - check the \"eve_logs\" path "
-                                   "in config.json");
+                                   "eve chat logs not found - set \"eve_logs\" to your "
+                                   "EVE logs path in config.json");
 
             // structures per system for highlights + the side panel
             std::map<std::string, std::vector<const Row*>> by_sys;
@@ -999,123 +1811,238 @@ int main(int argc, char** argv) {
 
             ImGui::BeginChild("map", ImVec2(ImGui::GetContentRegionAvail().x * 0.75f, 0), true);
             {
+                // eveterm's map renderer, cloned: isotropic zoom-to-cursor, tiny
+                // faint dots that grow with zoom, hollow marker rings popping in
+                // past 10x, names at the 14x cutoff, dashed cross-region gates,
+                // glowing jump-bridge arcs with a travelling light, parallaxed
+                // region names. STOKER's own overlays (fuel rings, chat-log
+                // intel pulses, pilot rings) ride on top.
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 ImVec2 p0 = ImGui::GetCursorScreenPos();
                 ImVec2 sz = ImGui::GetContentRegionAvail();
+                ImVec2 mcenter(p0.x + sz.x * 0.5f, p0.y + sz.y * 0.5f);
+                float mbase = std::max(40.0f, std::min(sz.x, sz.y));
                 ImGui::InvisibleButton("mapcanvas", sz);
                 bool hovered = ImGui::IsItemHovered();
+                bool mactive = ImGui::IsItemActive();
                 auto& io2 = ImGui::GetIO();
-                static MapView* live = nullptr;  // pan/zoom act on the shared state
                 {
                     std::lock_guard<std::mutex> l(g_mtx);
-                    live = &g_map;
+                    MapView* live = &g_map;
+                    float scale0 = live->zoom * mbase;
                     if (hovered && io2.MouseWheel != 0) {
-                        float f = io2.MouseWheel > 0 ? 1.25f : 0.8f;
-                        live->zoom = std::clamp(live->zoom * f, 1.0f, 80.0f);
+                        // zoom toward the cursor: the system under the mouse stays put
+                        ImVec2 mpos = io2.MousePos;
+                        float bx = live->pan.x + (mpos.x - mcenter.x) / scale0;
+                        float by = live->pan.y + (mpos.y - mcenter.y) / scale0;
+                        live->zoom = std::clamp(
+                            live->zoom * (io2.MouseWheel > 0 ? 1.15f : 1.0f / 1.15f), 0.3f,
+                            60.0f);
+                        scale0 = live->zoom * mbase;
+                        live->pan.x = bx - (mpos.x - mcenter.x) / scale0;
+                        live->pan.y = by - (mpos.y - mcenter.y) / scale0;
                     }
-                    if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                        ImVec2 d = io2.MouseDelta;
-                        live->pan.x -= d.x / (live->zoom * sz.x);
-                        live->pan.y -= d.y / (live->zoom * sz.y);
+                    if (mactive && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                        live->pan.x -= io2.MouseDelta.x / scale0;
+                        live->pan.y -= io2.MouseDelta.y / scale0;
                     }
                     mv = *live;
                 }
-                auto at = [&](const MapNode& n) {
-                    return ImVec2(p0.x + sz.x * 0.5f + (float)(n.nx - mv.pan.x) * mv.zoom * sz.x,
-                                  p0.y + sz.y * 0.5f + (float)(n.ny - mv.pan.y) * mv.zoom * sz.y);
+                const float scale = mv.zoom * mbase;
+                auto at2 = [&](double nx, double ny) {
+                    return ImVec2(mcenter.x + (float)(nx - mv.pan.x) * scale,
+                                  mcenter.y + (float)(ny - mv.pan.y) * scale);
                 };
+                auto at = [&](const MapNode& n) { return at2(n.nx, n.ny); };
+                dl->PushClipRect(p0, ImVec2(p0.x + sz.x, p0.y + sz.y), true);
+                auto inView = [&](const ImVec2& s) {
+                    return s.x >= p0.x - 30 && s.x <= p0.x + sz.x + 30 && s.y >= p0.y - 30 &&
+                           s.y <= p0.y + sz.y + 30;
+                };
+                auto dashed = [&](ImVec2 a, ImVec2 b, ImU32 col, float th) {
+                    float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);
+                    if (len < 1.0f) return;
+                    float ux = dx / len, uy = dy / len;
+                    for (float t = 0.0f; t < len; t += 9.0f) {
+                        float t2 = std::min(t + 5.0f, len);
+                        dl->AddLine(ImVec2(a.x + ux * t, a.y + uy * t),
+                                    ImVec2(a.x + ux * t2, a.y + uy * t2), col, th);
+                    }
+                };
+                const ImU32 kGate = IM_COL32(70, 74, 92, 255);
                 for (auto& g : mv.gates) {
-                    ImVec2 a = at(mv.nodes[g.first]), b = at(mv.nodes[g.second]);
-                    if ((a.x < p0.x && b.x < p0.x) || (a.y < p0.y && b.y < p0.y) ||
-                        (a.x > p0.x + sz.x && b.x > p0.x + sz.x) ||
-                        (a.y > p0.y + sz.y && b.y > p0.y + sz.y))
-                        continue;
-                    dl->AddLine(a, b, IM_COL32(70, 74, 92, 255));
+                    const MapNode& na = mv.nodes[g.first];
+                    const MapNode& nb = mv.nodes[g.second];
+                    ImVec2 a = at(na), b = at(nb);
+                    if (!inView(a) && !inView(b)) continue;
+                    if (na.region && nb.region && na.region != nb.region)
+                        dashed(a, b, kGate, 1.6f);  // cross-region jumps read as stitches
+                    else
+                        dl->AddLine(a, b, kGate, 1.6f);
                 }
-                // big region names over the universe map, fading out as the
-                // zoom closes in (eveterm's behaviour)
+                // region names: solid when zoomed out, gone by 10x, drifting
+                // slightly on zoom (parallax) exactly like eveterm
                 if (mv.region == "New Eden") {
-                    int ra = (int)std::clamp(240.0f * (10.0f - mv.zoom) / 6.0f, 0.0f, 240.0f);
+                    float rfs = std::clamp(13.0f + mv.zoom * 1.6f, 15.0f, 34.0f);
+                    int ra = (int)(mv.zoom <= 4.0f
+                                       ? 240.0f
+                                       : std::clamp(240.0f * (10.0f - mv.zoom) / 6.0f, 0.0f,
+                                                    240.0f));
                     if (ra > 2) {
                         ImU32 rcol = IM_COL32(208, 218, 240, ra);
                         ImFont* rfont = ImGui::GetFont();
-                        float rfs = 22.0f;
                         for (auto& rl : g_region_labels) {
-                            MapNode fake;
-                            fake.nx = rl.nx;
-                            fake.ny = rl.ny;
-                            ImVec2 s = at(fake);
-                            if (s.x < p0.x - 200 || s.x > p0.x + sz.x + 200 || s.y < p0.y - 40 ||
-                                s.y > p0.y + sz.y + 40)
-                                continue;
+                            ImVec2 raw = at2(rl.nx, rl.ny);
+                            ImVec2 s(raw.x - 0.05f * (float)(rl.nx - 0.5) * scale,
+                                     raw.y - 0.05f * (float)(rl.ny - 0.5) * scale);
+                            if (!inView(s)) continue;
                             float tw = rfont->CalcTextSizeA(rfs, 1e30f, 0.0f, rl.name.c_str()).x;
                             dl->AddText(rfont, rfs, ImVec2(s.x - tw * 0.5f, s.y - rfs * 0.5f),
                                         rcol, rl.name.c_str());
                         }
                     }
                 }
-                // friendly Ansiblex bridges: blue arcs over the gate lines,
-                // matching eveterm's map (endpoints resolved at map build)
-                for (auto& jb : mv.jb) {
-                    ImVec2 pa = at(mv.nodes[jb.first]), pb = at(mv.nodes[jb.second]);
-                    if ((pa.x < p0.x && pb.x < p0.x) || (pa.y < p0.y && pb.y < p0.y) ||
-                        (pa.x > p0.x + sz.x && pb.x > p0.x + sz.x) ||
-                        (pa.y > p0.y + sz.y && pb.y > p0.y + sz.y))
-                        continue;
-                    ImVec2 mid((pa.x + pb.x) * 0.5f, (pa.y + pb.y) * 0.5f);
-                    ImVec2 d(pb.x - pa.x, pb.y - pa.y);
-                    dl->AddBezierQuadratic(pa, ImVec2(mid.x - d.y * 0.18f, mid.y + d.x * 0.18f),
-                                           pb, IM_COL32(90, 175, 255, 220), 1.6f);
+                // dot sizing: tiny + faint zoomed out, stepping up to full
+                // markers at the name cutoff (eveterm's numbers verbatim)
+                const float kCutoff = 14.0f;
+                const float kLabelFs = 19.0f;
+                bool showNames = mv.region != "New Eden" || mv.zoom >= kCutoff;
+                float dotR;
+                int dotAlpha;
+                if (mv.zoom < kCutoff) {
+                    float t = std::clamp(mv.zoom / kCutoff, 0.0f, 1.0f);
+                    dotR = 0.8f + t * 1.3f;
+                    dotAlpha = (int)(85.0f + t * 120.0f);
+                } else {
+                    dotR = 14.0f;
+                    float t = std::clamp((mv.zoom - kCutoff) / 2.0f, 0.0f, 1.0f);
+                    dotAlpha = (int)(170.0f + 85.0f * t);
                 }
-                int clicked = -1;
-                // on the universe map, labels only appear once zoomed in enough
-                // to read them; structure and selected systems always label
-                bool labels = mv.nodes.size() < 600 || mv.zoom >= 8.0f;
+                if (mv.region != "New Eden") dotR = std::max(dotR, 3.5f);  // small maps
+                float hitR = dotR + 6.0f;
+                ImU32 dotCol = IM_COL32(198, 208, 228, dotAlpha);
+                ImFont* fnt2 = ImGui::GetFont();
+                int hoverIdx = -1;
+                float hbest = 1e18f;
+                ImVec2 mp2 = io2.MousePos;
+                time_t nowt2 = time(nullptr);
                 for (int i = 0; i < (int)mv.nodes.size(); i++) {
-                    ImVec2 q = at(mv.nodes[i]);
-                    if (q.x < p0.x - 30 || q.x > p0.x + sz.x + 30 || q.y < p0.y - 10 ||
-                        q.y > p0.y + sz.y + 10)
-                        continue;
-                    auto bs = by_sys.find(mv.nodes[i].label);
-                    ImU32 dot = IM_COL32(160, 168, 190, 255);
-                    if (bs != by_sys.end()) {
+                    const MapNode& n = mv.nodes[i];
+                    ImVec2 q = at(n);
+                    if (!inView(q)) continue;
+                    auto bs = by_sys.find(n.label);
+                    bool mine = bs != by_sys.end();
+                    ImU32 dc = dotCol;
+                    if (pilot_sys.count(n.llabel)) dc = IM_COL32(80, 255, 140, 255);
+                    dl->AddCircleFilled(q, i == mv.selected ? dotR + 1.5f : dotR, dc, 0);
+                    // past 10x every system gains a hollow marker ring, fading
+                    // in over 10 -> 12, before full dots + names land at 14
+                    if (mv.zoom > 10.0f && mv.zoom < kCutoff) {
+                        int ha = (int)(std::clamp((mv.zoom - 10.0f) / 2.0f, 0.0f, 1.0f) * 200.0f);
+                        if (ha > 2) dl->AddCircle(q, 7.0f, IM_COL32(198, 208, 228, ha), 0, 1.4f);
+                    }
+                    // STOKER overlay: worst fuel band of tracked structures here
+                    if (mine) {
                         int worst = 3;
                         for (auto* r : bs->second)
                             if (r->has_fuel) worst = std::min(worst, urgency_band(r->days));
-                        dot = band_u32(worst);
-                        dl->AddCircle(q, 7.0f, dot, 0, 2.0f);
+                        dl->AddCircle(q, dotR + 4.0f, band_u32(worst), 0, 2.0f);
                     }
-                    const std::string& ll = mv.nodes[i].llabel;
-                    if (auto ia = intel_at.find(ll); ia != intel_at.end()) {
-                        double age = difftime(time(nullptr), ia->second);
-                        int alpha;
+                    // STOKER overlay: chat-log intel pulse
+                    if (auto ia = intel_at.find(n.llabel); ia != intel_at.end()) {
+                        double age = difftime(nowt2, ia->second);
+                        float ir = dotR * 2.4f + 3.0f;
                         if (age < 300) {
-                            alpha = (int)(150 + 105 * std::sin(ImGui::GetTime() * 6.0));
-                            g_flash_active = true;  // keep the event loop fast enough
+                            float pulse = 0.55f + 0.45f * (float)std::sin(ImGui::GetTime() * 5.0);
+                            dl->AddCircleFilled(q, ir, IM_COL32(255, 45, 45, (int)(28 + 42 * pulse)), 0);
+                            dl->AddCircle(q, ir, IM_COL32(255, 45, 45, (int)(110 + 140 * pulse)), 0, 3.0f);
+                            g_flash_active = true;  // keep the event loop fast
                         } else {
-                            alpha = (int)(255 * (1.0 - age / 1800.0));
+                            int alpha = (int)(255 * (1.0 - age / 1800.0));
+                            if (alpha > 0)
+                                dl->AddCircle(q, ir, IM_COL32(255, 45, 45, alpha), 0, 2.5f);
                         }
-                        if (alpha > 0)
-                            dl->AddCircle(q, 12.0f, IM_COL32(255, 60, 60, alpha), 0, 2.5f);
                     }
-                    if (pilot_sys.count(ll))
-                        dl->AddCircle(q, 9.0f, IM_COL32(80, 255, 140, 255), 0, 2.5f);
-                    bool selq = mv.selected == i;
-                    dl->AddCircleFilled(q, selq ? 4.5f : 3.0f, selq ? IM_COL32(0, 229, 255, 255) : dot);
-                    if (labels || selq || bs != by_sys.end())
-                        dl->AddText(ImVec2(q.x + 6, q.y - 7),
-                                    selq ? IM_COL32(0, 229, 255, 255)
-                                         : IM_COL32(200, 206, 222, 255),
-                                    mv.nodes[i].label.c_str());
-                    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                        ImVec2 mp = io2.MousePos;
-                        float dx = mp.x - q.x, dy = mp.y - q.y;
-                        if (dx * dx + dy * dy < 12 * 12) clicked = i;
+                    if (hovered) {
+                        float dx = q.x - mp2.x, dy = q.y - mp2.y, d2 = dx * dx + dy * dy;
+                        if (d2 < hbest && d2 <= hitR * hitR) {
+                            hbest = d2;
+                            hoverIdx = i;
+                        }
                     }
                 }
-                if (clicked >= 0) {
+                // jump bridges after the dots so the arcs sit over the systems:
+                // glow halo + bright core + a light travelling along each arc
+                {
+                    double tt = ImGui::GetTime();
+                    int idx2 = 0;
+                    for (auto& jb : mv.jb) {
+                        ++idx2;
+                        ImVec2 pa = at(mv.nodes[jb.first]), pb = at(mv.nodes[jb.second]);
+                        if (!inView(pa) && !inView(pb)) continue;
+                        float ddx = pb.x - pa.x, ddy = pb.y - pa.y;
+                        float L = std::sqrt(ddx * ddx + ddy * ddy);
+                        ImVec2 mid(0.5f * (pa.x + pb.x), 0.5f * (pa.y + pb.y));
+                        ImVec2 c = mid;
+                        if (L >= 1.0f) {
+                            ImVec2 perp(-ddy / L, ddx / L);
+                            if (perp.y > 0) { perp.x = -perp.x; perp.y = -perp.y; }
+                            c = ImVec2(mid.x + perp.x * L * 0.18f, mid.y + perp.y * L * 0.18f);
+                        }
+                        dl->AddBezierQuadratic(pa, c, pb, IM_COL32(90, 175, 255, 45), 6.0f, 0);
+                        dl->AddBezierQuadratic(pa, c, pb, IM_COL32(120, 195, 255, 90), 3.0f, 0);
+                        dl->AddBezierQuadratic(pa, c, pb, IM_COL32(150, 210, 255, 255), 1.7f, 0);
+                        float u = std::fmod((float)tt * 0.33f + idx2 * 0.17f, 1.0f), m1 = 1.0f - u;
+                        ImVec2 tp(m1 * m1 * pa.x + 2 * m1 * u * c.x + u * u * pb.x,
+                                  m1 * m1 * pa.y + 2 * m1 * u * c.y + u * u * pb.y);
+                        dl->AddCircleFilled(tp, 2.0f, IM_COL32(205, 232, 255, 220), 8);
+                        g_flash_active = true;  // the travelling light needs redraws
+                    }
+                }
+                // selection + hover rings
+                if (mv.selected >= 0 && mv.selected < (int)mv.nodes.size()) {
+                    ImVec2 q = at(mv.nodes[mv.selected]);
+                    if (inView(q))
+                        dl->AddCircle(q, dotR * 1.8f + 2.0f, IM_COL32(0, 229, 255, 255), 0, 2.0f);
+                }
+                if (hoverIdx >= 0 && hoverIdx != mv.selected) {
+                    ImVec2 q = at(mv.nodes[hoverIdx]);
+                    dl->AddCircle(q, dotR * 1.8f + 2.0f, IM_COL32(255, 255, 255, 230), 0, 1.5f);
+                }
+                // labels below the dots, one per system: generic names appear
+                // at the cutoff; structure/pilot/selected/hover always label
+                auto labelBelow = [&](ImVec2 s, const std::string& txt, ImU32 col,
+                                      float clearance, float fs) {
+                    float w = fnt2->CalcTextSizeA(fs, 1e30f, 0.0f, txt.c_str()).x;
+                    dl->AddText(fnt2, fs, ImVec2(s.x - w * 0.5f, s.y + clearance + 2.0f), col,
+                                txt.c_str());
+                };
+                float smallFs = std::clamp(12.0f + mv.zoom * 0.5f, 12.0f, kLabelFs);
+                for (int i = 0; i < (int)mv.nodes.size(); i++) {
+                    const MapNode& n = mv.nodes[i];
+                    ImVec2 q = at(n);
+                    if (!inView(q)) continue;
+                    bool mine = by_sys.count(n.label) > 0;
+                    bool pil = pilot_sys.count(n.llabel) > 0;
+                    bool special = i == mv.selected || i == hoverIdx || mine || pil;
+                    if (!showNames && !special) continue;
+                    ImU32 col = i == mv.selected ? IM_COL32(0, 229, 255, 255)
+                                : i == hoverIdx  ? IM_COL32(255, 255, 255, 230)
+                                : pil            ? IM_COL32(80, 255, 140, 255)
+                                                 : IM_COL32(228, 234, 244, 255);
+                    labelBelow(q, n.label, col, dotR + (special ? 3.0f : 0.0f),
+                               showNames ? kLabelFs : smallFs);
+                }
+                dl->PopClipRect();
+                char hud[160];
+                std::snprintf(hud, sizeof hud,
+                              "zoom %.2f   (names at %.0fx)   drag = pan  wheel = zoom  "
+                              "click a system",
+                              mv.zoom, kCutoff);
+                dl->AddText(ImVec2(p0.x + 6, p0.y + 5), IM_COL32(140, 152, 172, 235), hud);
+                if (hoverIdx >= 0 && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                     std::lock_guard<std::mutex> l(g_mtx);
-                    g_map.selected = clicked;
+                    g_map.selected = hoverIdx;
                 }
             }
             ImGui::EndChild();
@@ -1159,7 +2086,7 @@ int main(int argc, char** argv) {
                         char db2[32];
                         std::snprintf(db2, sizeof db2, "%.1fd", r->days);
                         gauge(("m" + std::to_string(r->sid)).c_str(),
-                              r->has_fuel ? r->days / GAUGE_DAYS : -1,
+                              r->has_fuel ? r->days / pref_fuel(*r).cap : -1,
                               r->has_fuel ? db2 : "--", "",
                               ImGui::GetContentRegionAvail().x - 4, false, g_ic_fuel);
                         ImGui::TextColored(GREY_, "%s", r->name.c_str());
@@ -1218,6 +2145,11 @@ int main(int argc, char** argv) {
                      (n.type == "StructureUnderAttack" || n.type == "StructureLostShields" ||
                       n.type == "StructureLostArmor"))
                 attacked_sids.insert(n.sid);
+            else if (age < 1800 && n.moon_id && n.type == "TowerAlertMe") {
+                // POS attacks name the moon, not the hull: map back to the row
+                for (auto& r : rows)
+                    if (r.is_pos && r.moon_id == n.moon_id) attacked_sids.insert(r.sid);
+            }
         }
         auto row_gone = [&](const Row& r) {  // automated removal signals
             return r.state == "unanchored" || destroyed_sids.count(r.sid) > 0;
@@ -1239,11 +2171,28 @@ int main(int argc, char** argv) {
             for (auto& r : rows)
                 if (r.rental == "private") rented++;
             ImGui::SameLine();
-            ImGui::Checkbox("corp only", &g_corp_only);
-            if (g_corp_only && rented) {
-                ImGui::SameLine();
-                ImGui::TextColored(GREY_, "(%d rented hidden)", rented);
-            }
+            if (toggle_btn("corp only", g_corp_only)) g_corp_only = !g_corp_only;
+        }
+        ImGui::SameLine();
+        if (toggle_btn("needs fuel", g_prefs.fuel_filter)) {
+            g_prefs.fuel_filter = !g_prefs.fuel_filter;
+            prefs_save();
+        }
+        ImGui::SetItemTooltip(
+            "hide structures above their fuel alert level\n(levels per type in "
+            "settings; per structure in its detail panel)");
+        ImGui::SameLine();
+        if (toggle_btn("flags", g_prefs.warn_filter != 0)) {
+            g_prefs.warn_filter = g_prefs.warn_filter ? 0 : 1;
+            prefs_save();
+        }
+        ImGui::SetItemTooltip(
+            "on = only structures with a warning flag\n(which flags count is set "
+            "in settings; overrides needs fuel)");
+        if (rentals_online && g_corp_only && rented) {
+            // rides AFTER the buttons so toggling corp-only never shifts them
+            ImGui::SameLine();
+            ImGui::TextColored(GREY_, "(%d rented hidden)", rented);
         }
 
         // filtered view (built before the counters so the header numbers
@@ -1255,12 +2204,35 @@ int main(int argc, char** argv) {
             // automated removal: fully-unanchored hulls and freshly-destroyed
             // structures (notification beats the hourly list) drop on their own
             if (!g_show_hidden && row_gone(r)) continue;
+            // manual hides (structure settings popup; unhide from settings)
+            if (g_prefs.hidden.count(r.sid)) continue;
             if (rentals_online && g_corp_only && r.rental == "private") continue;
+            // skyhooks live on their own tab only, never in All
+            if (g_type_tab.empty() && r.is_skyhook) continue;
             if (!g_type_tab.empty() && r.type != g_type_tab) continue;
             if (!f.empty()) {
                 std::string hay = r.name + " " + r.system + " " + r.type;
                 for (auto& c : hay) c = (char)tolower((unsigned char)c);
                 if (hay.find(f) == std::string::npos) continue;
+            }
+            // flags overrides needs-fuel: while it is pressed, every flagged
+            // structure shows and nothing else does. Needs-fuel only applies
+            // when the flags filter is off.
+            if (g_prefs.warn_filter) {
+                // skyhooks carry WF_SKYWIN while a theft window is announced,
+                // so the flags filter surfaces exactly the hooks that matter
+                unsigned fl = row_flags(r, attacked_sids, extractions_ok) &
+                              g_prefs.warn_mask;
+                if (!fl) continue;  // on = flagged only
+            } else if (g_prefs.fuel_filter && !r.is_skyhook) {
+                // keep rows at/below their alert level on any days-based bar
+                // (no fuel data at all also counts as needy)
+                bool needy = !r.has_fuel;
+                if (r.has_fuel && r.days <= pref_fuel(r).alert) needy = true;
+                if (r.gas_day > 0 && r.fuel2 >= 0 &&
+                    fuel2_days(r) <= pref_gas(r).alert)
+                    needy = true;
+                if (!needy) continue;
             }
             view.push_back(&r);
         }
@@ -1296,6 +2268,13 @@ int main(int argc, char** argv) {
                                    sys.c_str());
             }
         }
+        // why POS rows are missing, when they are fixably missing
+        if (pos_status == "relogin")
+            ImGui::TextColored(GREY_,
+                               "POS towers hidden: re-login this character (alt+c) to grant "
+                               "the starbases scope");
+        else if (pos_status == "director")
+            ImGui::TextColored(GREY_, "POS towers hidden: needs the in-game Director role");
 
         // split: table left, detail/log right
         float leftw = ImGui::GetContentRegionAvail().x * 0.62f;
@@ -1325,7 +2304,9 @@ int main(int argc, char** argv) {
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4, 6));
         if (ImGui::BeginTable("structs", 3,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                                  ImGuiTableFlags_BordersInnerH)) {
+                                  ImGuiTableFlags_BordersInnerH,
+                              // leave one line under the table for the totals bar
+                              ImVec2(0, -(ImGui::GetTextLineHeightWithSpacing() + 6)))) {
             ImGui::TableSetupColumn("Fuel", ImGuiTableColumnFlags_WidthFixed, 250);
             ImGui::TableSetupColumn("System", ImGuiTableColumnFlags_WidthFixed, 70);
             ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
@@ -1334,6 +2315,16 @@ int main(int argc, char** argv) {
             // fuel and gas clocks)
             std::stable_sort(view.begin(), view.end(), [](const Row* a, const Row* b) {
                 auto worst = [](const Row* r) {
+                    if (r->is_skyhook) {
+                        // own tab only: open windows first, then soonest to
+                        // open, windowless hooks at the bottom
+                        time_t nowt = time(nullptr);
+                        time_t ws = r->sky_wstart.empty() ? 0 : parse_iso(r->sky_wstart);
+                        time_t we = r->sky_wend.empty() ? 0 : parse_iso(r->sky_wend);
+                        if (ws && we && nowt >= ws && nowt < we) return 0.0;
+                        if (ws && nowt < ws) return (double)(ws - nowt) / 86400.0;
+                        return 1e9;
+                    }
                     double d = r->has_fuel ? r->days : 1e9;
                     double g = fuel2_days(*r);
                     if (g >= 0) d = std::min(d, g);
@@ -1342,8 +2333,8 @@ int main(int argc, char** argv) {
                 return worst(a) < worst(b);
             });
 
-            for (auto* rp : view) {
-                const Row& r = *rp;
+            for (size_t vi = 0; vi < view.size(); vi++) {
+                const Row& r = *view[vi];
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 dual_gauge(r, 240);
@@ -1366,6 +2357,19 @@ int main(int argc, char** argv) {
                     ImU32 fcol = 0;
                     if (limbo) {
                         // no power badge while the hull isn't in service yet
+                    } else if (r.is_pos) {
+                        // tower power rules (see row_flags): offline is a
+                        // parked state, not a fuel emergency
+                        if (r.state == "offline") {
+                            ftxt = "OFFLINE";
+                            fcol = IM_COL32(128, 136, 150, 255);
+                        } else if (r.state == "online" && r.has_fuel && r.days <= 0) {
+                            ftxt = "LOW POWER";
+                            fcol = IM_COL32(255, 140, 0, 255);
+                        } else if (r.state == "online" && r.has_fuel && r.days < 7) {
+                            ftxt = "LOW FUEL";
+                            fcol = IM_COL32(250, 215, 70, 255);
+                        }
                     } else if (r.has_fuel && r.days <= -7) {
                         ftxt = "ABANDONED";
                         fcol = IM_COL32(255, 70, 70, 255);
@@ -1391,12 +2395,44 @@ int main(int argc, char** argv) {
                 ImGui::TableSetColumnIndex(2);
                 float rowh = gauge_cell_h(3);  // uniform: every row Metenox-sized
                 ImVec2 cp = ImGui::GetCursorScreenPos();
+                bool tallied = g_tally.count(r.sid) > 0;
+                if (tallied)  // amber wash + gold edge bar below: unmissable
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                           IM_COL32(122, 86, 6, 140));
                 if (ImGui::Selectable(("##row" + std::to_string(r.sid)).c_str(),
                                       r.sid == detail_sid,
                                       ImGuiSelectableFlags_SpanAllColumns,
                                       ImVec2(0, rowh))) {
-                    detail_sid = r.sid;
-                    view_tab = 0;
+                    ImGuiIO& cio = ImGui::GetIO();
+                    // skyhooks are their own thing: never part of a haul batch
+                    if (cio.KeyShift && !r.is_skyhook) {
+                        // range from the last tally click, in the visible sort order
+                        int ai = -1, bi = (int)vi;
+                        for (int k = 0; k < (int)view.size(); k++)
+                            if (view[k]->sid == g_tally_anchor) { ai = k; break; }
+                        if (ai < 0) ai = bi;
+                        for (int k = std::min(ai, bi); k <= std::max(ai, bi); k++)
+                            if (!view[k]->is_skyhook) g_tally.insert(view[k]->sid);
+                        g_tally_anchor = r.sid;
+                        view_tab = 0;
+                    } else if (cio.KeyCtrl) {
+                        if (!r.is_skyhook) {
+                            if (!g_tally.erase(r.sid)) {
+                                g_tally.insert(r.sid);
+                                g_tally_anchor = r.sid;
+                            }
+                            view_tab = 0;
+                        }
+                    } else {
+                        detail_sid = r.sid;
+                        view_tab = 0;
+                    }
+                }
+                if (tallied) {
+                    ImVec2 tmn = ImGui::GetItemRectMin(), tmx = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddRectFilled(
+                        ImVec2(tmn.x, tmn.y), ImVec2(tmn.x + 4, tmx.y),
+                        IM_COL32(255, 196, 0, 255));
                 }
                 ImDrawList* dl2 = ImGui::GetWindowDrawList();
                 float lh = ImGui::GetTextLineHeight();
@@ -1405,7 +2441,7 @@ int main(int argc, char** argv) {
                 // indents past it (space reserved even without art so rows align)
                 float ix = rowh - 8 + 8;
                 {
-                    auto ti = g_type_icons.find(r.type);
+                    auto ti = g_type_icons.find(icon_key(r));
                     if (ti != g_type_icons.end())
                         dl2->AddImageRounded(ti->second, ImVec2(cp.x, cp.y + 1),
                                              ImVec2(cp.x + rowh - 8, cp.y + rowh - 7),
@@ -1420,7 +2456,8 @@ int main(int argc, char** argv) {
                     float fs = std::min(lh - 2.0f, 15.0f);  // compact sub-rows
                     float y0 = cp.y + lh + 3, sp = fs + 3;
                     int layers = 3;
-                    if (r.state == "armor_reinforce" || r.state == "armor_vulnerable")
+                    if (r.state == "armor_reinforce" || r.state == "armor_vulnerable" ||
+                        r.state == "reinforced")  // a POS reinforces at 25% shield
                         layers = 2;
                     else if (r.state == "hull_reinforce" || r.state == "hull_vulnerable")
                         layers = 1;
@@ -1464,6 +2501,13 @@ int main(int argc, char** argv) {
                                      IM_COL32(255, 70, 70, 255), wa);
                             dl2->AddText(fnt, fs, ImVec2(tx + fs + 4, y0 + 2 * sp),
                                          IM_COL32(255, 70, 70, wa), "RAIDABLE");
+                        } else if (tt != "none") {
+                            // window announced but not open yet: steady amber
+                            // heads-up (the Window: line carries the countdown)
+                            warn_tri(dl2, ImVec2(tx, y0 + 2 * sp + 1), fs - 2,
+                                     IM_COL32(250, 215, 70, 255), 255);
+                            dl2->AddText(fnt, fs, ImVec2(tx + fs + 4, y0 + 2 * sp),
+                                         IM_COL32(250, 215, 70, 255), "WINDOW SOON");
                         }
                     } else {
                     {
@@ -1482,6 +2526,13 @@ int main(int argc, char** argv) {
                         moonpull_info(r, extractions_ok, mt, mc);
                         dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp), mc,
                                      mt.c_str());
+                    } else if (r.has_econ) {
+                        // Metenox: the moon-pull slot carries the monthly net
+                        dl2->AddText(fnt, fs, ImVec2(tx, y0 + sp), IM_COL32(128, 136, 150, 255),
+                                     "Net:");
+                        dl2->AddText(fnt, fs, ImVec2(tx + w_moonpull + 6, y0 + sp),
+                                     net_col(r.econ_net),
+                                     (net_str(r.econ_net) + "/mo").c_str());
                     }
                     // state warning under Moon Pull: no label, blank when calm,
                     // flashing triangle + text when something is happening.
@@ -1500,6 +2551,14 @@ int main(int argc, char** argv) {
                             r.state == "armor_vulnerable" || r.state == "hull_vulnerable") {
                             wtxt = "UNDER ATTACK";
                             wcol = IM_COL32(255, 70, 70, 255);
+                        } else if (r.state == "reinforced") {
+                            // a tower only reinforces because someone shot it;
+                            // the Timer slot counts down reinforced_until
+                            wtxt = "REINFORCED";
+                            wcol = IM_COL32(255, 70, 70, 255);
+                        } else if (r.is_pos && r.state == "onlining") {
+                            wtxt = "ONLINING...";
+                            wcol = IM_COL32(250, 215, 70, 255);
                         } else if (r.state == "unanchored") {
                             wtxt = "UNANCHORED";
                             wcol = IM_COL32(250, 215, 70, 255);
@@ -1535,6 +2594,62 @@ int main(int argc, char** argv) {
             ImGui::EndTable();
         }
         ImGui::PopStyleVar();
+
+        // totals bar: current stock across everything visible on this tab
+        // (the ctrl+click haul tally lives in the detail panel). Fuel/gas
+        // stock only exists where the data source can see the bay, so unseen
+        // rows are counted and disclosed.
+        {
+            double blk = 0, gas = 0, ozone = 0, goo = 0, goo_isk = 0;
+            bool any_isk = false;
+            int blind = 0;
+            for (auto* rp : view) {
+                const Row& r = *rp;
+                bool saw = false;
+                if (r.blocks_now >= 0) { blk += r.blocks_now; saw = true; }
+                if (r.fuel2 >= 0) {
+                    if (r.fuel2_name == "Magmatic Gas") gas += r.fuel2;
+                    else if (r.fuel2_name == "Liquid Ozone") ozone += r.fuel2;
+                    saw = true;
+                }
+                if (r.goo_m3 >= 0) { goo += r.goo_m3; saw = true; }
+                if (r.goo_isk >= 0) { goo_isk += r.goo_isk; any_isk = true; }
+                if (!saw && !r.is_skyhook) blind++;
+            }
+            ImGui::TextColored(GREY_, "TOTAL shown %d", (int)view.size());
+            ImGui::SameLine();
+            ImGui::TextColored(GREY_, "  fuel");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.51f, 1), "%s blk / %s m3",
+                               commas(blk).c_str(), commas(blk * 5).c_str());
+            if (gas > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(GREY_, "  gas");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.98f, 0.55f, 0.85f, 1), "%s / %s m3",
+                                   commas(gas).c_str(), commas(gas * 0.01).c_str());
+            }
+            if (ozone > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(GREY_, "  ozone");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1), "%s / %s m3",
+                                   commas(ozone).c_str(), commas(ozone * 0.4).c_str());
+            }
+            if (goo > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(GREY_, "  moon hold");
+                ImGui::SameLine();
+                std::string gtxt = commas(goo) + " m3";
+                if (any_isk) gtxt += " (" + isk_compact(goo_isk) + ")";
+                ImGui::TextColored(CYAN_, "%s", gtxt.c_str());
+            }
+            if (blind > 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(GREY_, "  (%d no bay data)", blind);
+            }
+            ImGui::SetItemTooltip("ctrl+click / shift+click rows for a hauling tally");
+        }
         ImGui::EndChild();
 
         ImGui::SameLine();
@@ -1546,12 +2661,159 @@ int main(int argc, char** argv) {
                 const Row* d = nullptr;
                 for (auto& r : rows)
                     if (r.sid == detail_sid) { d = &r; break; }
-                if (!d) {
+                if (!g_tally.empty()) {
+                    // ---- hauling tally: what to move, where, in jump order ----
+                    load_universe();
+                    struct TItem {
+                        const Row* r;
+                        double blk = 0;          // fuel blocks to 30d
+                        double gas = -2;         // magmatic to 30d; -1 bay unseen, -2 n/a
+                        double oz = -2;          // ozone to doctrine target; same codes
+                        double goo = 0;          // metenox cargo pickup, m3
+                        int jumps = -1;
+                    };
+                    std::vector<TItem> items;
+                    int elsewhere = 0;
+                    for (auto& sid : g_tally) {
+                        const Row* rr = nullptr;
+                        for (auto& r : rows)
+                            if (r.sid == sid) { rr = &r; break; }
+                        if (!rr || rr->is_skyhook) {
+                            if (!rr) elsewhere++;
+                            continue;
+                        }
+                        TItem t;
+                        t.r = rr;
+                        double bn = need_fuel_units(*rr, pref_fuel(*rr).cap);
+                        if (bn > 0) t.blk = bn;
+                        if (rr->fuel2_name == "Magmatic Gas")
+                            t.gas = (rr->fuel2 >= 0 && rr->gas_day > 0)
+                                        ? need_gas_units(*rr, pref_gas(*rr).cap)
+                                        : -1;
+                        if (rr->fuel2_name == "Liquid Ozone" && rr->lo_target > 0)
+                            t.oz = rr->fuel2 >= 0 ? std::max(0.0, rr->lo_target - rr->fuel2)
+                                                  : -1;
+                        if (rr->goo_m3 > 0) t.goo = rr->goo_m3;
+                        items.push_back(t);
+                    }
+                    // jump counts from the pilot over gates + jump bridges
+                    int src = 0;
+                    std::string pilot_sys;
+                    if (!g_pilots.empty()) {
+                        pilot_sys = g_pilots[0].system;
+                        auto sit = g_sysid.find(lower_(pilot_sys));
+                        if (sit != g_sysid.end()) src = sit->second;
+                    }
+                    if (src) {
+                        auto& dist = jump_dists(src);
+                        for (auto& t : items) {
+                            auto sit = g_sysid.find(lower_(t.r->system));
+                            if (sit != g_sysid.end()) {
+                                auto dit = dist.find(sit->second);
+                                if (dit != dist.end()) t.jumps = dit->second;
+                            }
+                        }
+                    }
+                    std::stable_sort(items.begin(), items.end(),
+                                     [](const TItem& a, const TItem& b) {
+                                         unsigned ja = a.jumps < 0 ? 9999u : (unsigned)a.jumps;
+                                         unsigned jb2 = b.jumps < 0 ? 9999u : (unsigned)b.jumps;
+                                         if (ja != jb2) return ja < jb2;
+                                         return a.r->name < b.r->name;
+                                     });
+
+                    // totals; a category only exists if a selected type carries it
+                    double s_blk = 0, s_gas = 0, s_oz = 0, s_goo = 0;
+                    bool has_gas = false, has_oz = false, gas_blind = false, oz_blind = false;
+                    for (auto& t : items) {
+                        s_blk += t.blk;
+                        if (t.gas >= 0) { s_gas += t.gas; has_gas = true; }
+                        if (t.gas == -1) { has_gas = true; gas_blind = true; }
+                        if (t.oz >= 0) { s_oz += t.oz; has_oz = true; }
+                        if (t.oz == -1) { has_oz = true; oz_blind = true; }
+                        s_goo += t.goo;
+                    }
+                    double total_m3 = s_blk * 5 + s_gas * 0.01 + s_oz * 0.4 + s_goo;
+
+                    ImGui::TextColored(ImVec4(1.0f, 0.77f, 0.0f, 1), "HAUL TALLY - %d structures",
+                                       (int)items.size());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("clear")) g_tally.clear();
+                    if (elsewhere)
+                        ImGui::TextColored(GREY_, "(%d tallied on another corp tab not counted)",
+                                           elsewhere);
+                    ImGui::Separator();
+                    ImGui::TextColored(GREY_, "total to move");
+                    ImGui::SameLine();
+                    ImGui::TextColored(CYAN_, "%s m3", commas(total_m3).c_str());
+                    if (s_blk > 0)
+                        ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.51f, 1),
+                                           "  fuel blocks to max      %s blocks   %s m3",
+                                           commas(s_blk).c_str(), commas(s_blk * 5).c_str());
+                    if (has_gas)
+                        ImGui::TextColored(ImVec4(0.98f, 0.55f, 0.85f, 1),
+                                           "  magmatic gas to max     %s units   %s m3%s",
+                                           commas(s_gas).c_str(), commas(s_gas * 0.01).c_str(),
+                                           gas_blind ? "  (+? unseen bays)" : "");
+                    if (has_oz)
+                        ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1),
+                                           "  ozone to doctrine       %s units   %s m3%s",
+                                           commas(s_oz).c_str(), commas(s_oz * 0.4).c_str(),
+                                           oz_blind ? "  (+? unseen bays)" : "");
+                    if (s_goo > 0)
+                        ImGui::TextColored(CYAN_, "  metenox cargo pickup    %s m3",
+                                           commas(s_goo).c_str());
+                    ImGui::Separator();
+                    if (src)
+                        ImGui::TextColored(GREY_, "route from %s (gates + jump bridges)",
+                                           pilot_sys.c_str());
+                    else
+                        ImGui::TextColored(GREY_,
+                                           "no pilot position (EVE chat logs) - unsorted, "
+                                           "jumps unknown");
+                    ImGui::Spacing();
+                    for (auto& t : items) {
+                        const Row& r = *t.r;
+                        ImGui::PushID((int)(r.sid & 0x7fffffff));
+                        if (ImGui::SmallButton("set dest")) {
+                            auto sit = g_sysid.find(lower_(r.system));
+                            if (sit != g_sysid.end())
+                                act_set_destination(sit->second, r.system);
+                        }
+                        ImGui::PopID();
+                        ImGui::SameLine();
+                        if (t.jumps >= 0)
+                            ImGui::TextColored(ImVec4(1.0f, 0.77f, 0.0f, 1), "%2dj", t.jumps);
+                        else
+                            ImGui::TextColored(GREY_, " ?j");
+                        ImGui::SameLine();
+                        ImGui::TextColored(TEXTC, "%s", r.name.c_str());
+                        std::string in, out;
+                        auto add = [](std::string& s, const std::string& piece) {
+                            if (!s.empty()) s += ", ";
+                            s += piece;
+                        };
+                        if (t.blk > 0) add(in, commas(t.blk) + " blocks");
+                        if (t.gas > 0) add(in, commas(t.gas) + " gas");
+                        if (t.gas == -1) add(in, "gas ?");
+                        if (t.oz > 0) add(in, commas(t.oz) + " ozone");
+                        if (t.oz == -1) add(in, "ozone ?");
+                        if (t.goo > 0)
+                            out = commas(t.goo) + " m3 goo" +
+                                  (r.goo_isk > 0 ? " (" + isk_compact(r.goo_isk) + ")" : "");
+                        std::string line;
+                        if (!in.empty()) line += "in: " + in;
+                        if (!out.empty()) line += (line.empty() ? "" : "   ") + ("out: " + out);
+                        if (line.empty()) line = "nothing to haul";
+                        ImGui::TextColored(GREY_, "        %s", line.c_str());
+                        ImGui::Spacing();
+                    }
+                } else if (!d) {
                     ImGui::TextColored(GREY_, "select a structure");
                 } else {
                     ImGui::PushTextWrapPos(0.0f);
                     {
-                        auto ti = g_type_icons.find(d->type);
+                        auto ti = g_type_icons.find(icon_key(*d));
                         if (ti != g_type_icons.end())
                             ImGui::Image(ti->second, ImVec2(48, 48));
                         else
@@ -1560,7 +2822,8 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     ImGui::TextColored(CYAN_, "%s", d->name.c_str());
                     ImGui::TextColored(GREY_, "%s   %s   %s", d->system.c_str(),
-                                       d->type.c_str(), d->state.c_str());
+                                       d->is_pos ? d->tower.c_str() : d->type.c_str(),
+                                       d->state.c_str());
                     if (d->rental == "private")
                         ImGui::TextColored(PINK, "rented to %s",
                                            d->renter.empty() ? "?" : d->renter.c_str());
@@ -1622,6 +2885,30 @@ int main(int argc, char** argv) {
                             ImGui::SameLine();
                             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(mc), "%s",
                                                mt.c_str());
+                            // how this chunk actually popped (notification-fed)
+                            time_t arr =
+                                d->chunk_arrival.empty() ? 0 : parse_iso(d->chunk_arrival);
+                            if (d->popped_at && arr > 0 && d->popped_at >= arr - 120) {
+                                std::string ago =
+                                    fmt_dur((double)(time(nullptr) - d->popped_at));
+                                if (d->popped_manual)
+                                    ImGui::TextColored(TEXTC, "fired by %s, %s ago",
+                                                       d->popped_by.empty()
+                                                           ? "?" : d->popped_by.c_str(),
+                                                       ago.c_str());
+                                else
+                                    ImGui::TextColored(TEXTC, "auto-fractured %s ago",
+                                                       ago.c_str());
+                            }
+                            if (d->drill_rig_tier > 0) {
+                                ImGui::TextColored(GREY_, "Drill rig:");
+                                ImGui::SameLine();
+                                ImGui::TextColored(TEXTC, "%s", d->drill_rig.c_str());
+                                ImGui::TextColored(GREY_,
+                                                   "  +%d%% fire window, +%d%% field life",
+                                                   d->drill_rig_tier == 2 ? 24 : 20,
+                                                   d->drill_rig_tier == 2 ? 100 : 50);
+                            }
                         }
                         }
                     }
@@ -1631,8 +2918,37 @@ int main(int argc, char** argv) {
                     char b[64];
                     std::snprintf(b, sizeof b, "%.1f days", d->days);
                     if (d->has_fuel) {
-                        gauge("df", d->days / GAUGE_DAYS, b,
-                              to30(units_raw(*d)), gw, false, g_ic_fuel);
+                        float fcap = pref_fuel(*d).cap;
+                        gauge("df", d->days / fcap, b,
+                              to_cap(need_str(need_fuel_units(*d, fcap)), fcap), gw, false,
+                              g_ic_fuel);
+                        ImGui::Spacing();
+                    }
+                    if (d->is_pos) {
+                        // the fuel bay is real block counts (starbase detail
+                        // endpoint), unlike Upwell rows where it's clock-derived
+                        if (d->blocks_now >= 0)
+                            ImGui::TextColored(GREY_, "%s fuel blocks in the bay%s",
+                                               commas(d->blocks_now).c_str(),
+                                               d->state == "online" ? ""
+                                                                    : " (not burning)");
+                        if (d->bpd > 0)
+                            ImGui::TextColored(GREY_, "burn %s blocks/day%s",
+                                               commas(d->bpd).c_str(),
+                                               d->pos_sov ? " (sov holder, -25%)" : "");
+                        ImGui::Spacing();
+                        if (d->stront_hours >= 0) {
+                            char sh[32];
+                            std::snprintf(sh, sizeof sh, "%.1fh reinforce", d->stront_hours);
+                            gauge("dstr", d->stront_hours / POS_STRONT_MAX_H, sh,
+                                  commas(d->stront) + " stront", gw, true);
+                            ImGui::TextColored(GREY_,
+                                               "%s Strontium Clathrates = how long it holds "
+                                               "if reinforced",
+                                               commas(d->stront).c_str());
+                        } else {
+                            ImGui::TextColored(GREY_, "stront bay unreadable this pull");
+                        }
                         ImGui::Spacing();
                     }
                     if (!d->fuel2_name.empty()) {
@@ -1651,8 +2967,10 @@ int main(int argc, char** argv) {
                         } else if (d->gas_day > 0) {
                             char g2[64];
                             std::snprintf(g2, sizeof g2, "%.1f days", fuel2_days(*d));
-                            gauge("df2", fuel2_days(*d) / GAUGE_DAYS, g2,
-                                  to30(gas30_raw(*d)), gw, true, g_ic_gas);
+                            float gcap = pref_gas(*d).cap;
+                            gauge("df2", fuel2_days(*d) / gcap, g2,
+                                  to_cap(need_str(need_gas_units(*d, gcap)), gcap), gw, true,
+                                  g_ic_gas);
                             ImGui::TextColored(GREY_, "%s %s in the bay",
                                                commas(d->fuel2).c_str(), d->fuel2_name.c_str());
                         } else {
@@ -1665,12 +2983,15 @@ int main(int argc, char** argv) {
                         ImGui::Spacing();
                     }
                     if (d->goo_cap > 0) {
-                        double gf = d->goo_m3 >= 0 ? d->goo_m3 / d->goo_cap : -1;
-                        char gl[32];
-                        std::snprintf(gl, sizeof gl, "%.0f%% full", 100.0 * (gf < 0 ? 0 : gf));
-                        gauge("dgoo", gf, gf < 0 ? "?" : gl,
+                        double gf = d->goo_m3 >= 0
+                                        ? std::min(1.0, d->goo_m3 /
+                                                            std::max(1.0f, g_prefs.goo_max_m3))
+                                        : -1;
+                        std::string gl =
+                            d->goo_m3 >= 0 ? commas(d->goo_m3) + " m3" : "?";
+                        gauge("dgoo", gf, gl,
                               isk_compact(d->goo_isk < 0 ? 0 : d->goo_isk) + " isk", gw, false,
-                              g_ic_ozone, true);
+                              g_ic_goo, false, IM_COL32(0, 130, 148, 255));
                         ImGui::TextColored(GREY_, "moongoo %s of %s m3",
                                            commas(d->goo_m3 < 0 ? 0 : d->goo_m3).c_str(),
                                            commas(d->goo_cap).c_str());
@@ -1688,7 +3009,34 @@ int main(int argc, char** argv) {
                                                isk_compact(d->goo_isk).c_str());
                         ImGui::Spacing();
                     }
-                    if (d->bpd > 0)
+                    if (d->has_econ) {
+                        // monthly profitability: the drill's whole ledger as a
+                        // stacked equation (taxes = the alliance moon rent)
+                        ImGui::Separator();
+                        ImGui::TextColored(GREY_, "monthly profitability");
+                        auto eq = [](const char* pre, const char* label, double v,
+                                     ImU32 vcol) {
+                            char lbl[32];
+                            std::snprintf(lbl, sizeof lbl, "%s %-13s", pre, label);
+                            ImGui::TextColored(GREY_, "%s", lbl);
+                            ImGui::SameLine();
+                            char val[32];
+                            std::snprintf(val, sizeof val, "%9s", net_str(v).c_str());
+                            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(vcol),
+                                               "%s", val);
+                        };
+                        ImU32 plain = IM_COL32(200, 206, 222, 255);
+                        eq(" ", "Moon Goo", d->econ_goo, plain);
+                        eq("-", "Taxes", d->econ_rent, plain);
+                        eq("-", "Fuel Blocks", d->econ_fuel, plain);
+                        eq("-", "Magmatic Gas", d->econ_gas, plain);
+                        ImGui::TextColored(GREY_, "  ---------------------");
+                        eq("=", "NET", d->econ_net, net_col(d->econ_net));
+                        ImGui::SameLine();
+                        ImGui::TextColored(GREY_, "/month");
+                        ImGui::Spacing();
+                    }
+                    if (d->bpd > 0 && !d->is_pos)  // POS rows print their own burn line
                         ImGui::TextColored(GREY_, "rate %s blocks/day from online services",
                                            commas(d->bpd).c_str());
                     if (d->burn7 >= 0 || d->burn30 >= 0) {
@@ -1710,8 +3058,66 @@ int main(int argc, char** argv) {
                         for (auto& c : ls) c = (char)tolower((unsigned char)c);
                         load_universe();
                         auto sit = g_sysid.find(ls);
-                        if (sit != g_sysid.end() && ImGui::Button("set destination"))
-                            act_set_destination(sit->second, d->system);
+                        if (sit != g_sysid.end()) {
+                            if (ImGui::Button("set destination"))
+                                act_set_destination(sit->second, d->system);
+                            ImGui::SameLine();
+                        }
+                        // per-structure settings popup: alert/cap overrides
+                        // (beat the type levels) + hide, all persisted
+                        bool ovr = g_prefs.sid_fuel.count(d->sid) > 0 ||
+                                   g_prefs.sid_gas.count(d->sid) > 0;
+                        if (ImGui::Button(ovr ? "settings (custom)" : "settings"))
+                            ImGui::OpenPopup("structprefs");
+                        if (ImGui::BeginPopup("structprefs")) {
+                            ImGui::Dummy(ImVec2(380, 0));  // popup min width
+                            ImGui::TextColored(CYAN_, "%s", d->name.c_str());
+                            ImGui::TextColored(GREY_,
+                                               "alert feeds the needs-fuel filter; max "
+                                               "sets the bar cap + haul target");
+                            ImGui::Separator();
+                            FuelPref fp = pref_fuel(*d);
+                            bool ch = false;
+                            ImGui::TextColored(GREY_, "fuel alert");
+                            ImGui::SameLine(90);
+                            ch |= dial_slider("sfa", &fp.alert, 0.0f, 14.0f, "%.0f d");
+                            ImGui::TextColored(GREY_, "fuel max");
+                            ImGui::SameLine(90);
+                            ch |= dial_slider("sfc", &fp.cap, 1.0f, 90.0f, "%.0f d");
+                            if (ch) {
+                                g_prefs.sid_fuel[d->sid] = fp;
+                                g_prefs_dirty = true;
+                            }
+                            if (d->gas_day > 0) {
+                                FuelPref gp = pref_gas(*d);
+                                bool gh = false;
+                                ImGui::TextColored(GREY_, "gas alert");
+                                ImGui::SameLine(90);
+                                gh |= dial_slider("sga", &gp.alert, 0.0f, 14.0f, "%.0f d");
+                                ImGui::TextColored(GREY_, "gas max");
+                                ImGui::SameLine(90);
+                                gh |= dial_slider("sgc", &gp.cap, 1.0f, 90.0f, "%.0f d");
+                                if (gh) {
+                                    g_prefs.sid_gas[d->sid] = gp;
+                                    g_prefs_dirty = true;
+                                }
+                            }
+                            if (ovr && ImGui::SmallButton("back to type defaults")) {
+                                g_prefs.sid_fuel.erase(d->sid);
+                                g_prefs.sid_gas.erase(d->sid);
+                                prefs_save();
+                            }
+                            ImGui::Separator();
+                            if (ImGui::SmallButton("hide this structure")) {
+                                g_prefs.hidden.insert(d->sid);
+                                prefs_save();
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::SetItemTooltip(
+                                "drops it from the table; unhide from the settings "
+                                "window");
+                            ImGui::EndPopup();
+                        }
                     }
                     if (!g_standalone) {
                         ImGui::Separator();
@@ -1760,6 +3166,12 @@ int main(int argc, char** argv) {
         ImGui::EndChild();
         ImGui::End();
 
+        // flush deferred pref edits once the drag ends (no active widget)
+        if (g_prefs_dirty && !ImGui::IsAnyItemActive()) {
+            prefs_save();
+            g_prefs_dirty = false;
+        }
+
         ImGui::Render();
         int w, h;
         glfwGetFramebufferSize(win, &w, &h);
@@ -1771,7 +3183,12 @@ int main(int argc, char** argv) {
     }
 
     g_run = false;
+    if (g_prefs_dirty) { prefs_save(); g_prefs_dirty = false; }   // don't lose a mid-drag edit on quit
+    // a pending browser login would otherwise hold its join for up to 3 min,
+    // which reads as a frozen window / crash on close
+    standalone::cancel_pending_login();
     if (th.joinable()) th.join();
+    if (logs_th.joinable()) logs_th.join();
     {
         std::lock_guard<std::mutex> l(g_bg_mtx);
         for (auto& t : g_bg_threads)

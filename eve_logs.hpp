@@ -3,10 +3,19 @@
 // spotted in intel channels). Pure local file reads, no ESI. Everything is
 // best-effort: no logs on this machine = the feature is quietly off.
 //
+// Threading copied from SMT (EVEData/EveManager.cs): ALL filesystem work -
+// directory sweeps, per-file opens, tail reads, parsing - happens on a
+// dedicated watcher thread (SMT's LogFileCacheTrigger loop, 1500ms cadence;
+// their FileSystemWatcher events collapse into the same poll here, since the
+// open+read IS the metadata poke that made their watcher fire on Windows).
+// The render thread only lock-copies the finished results, so Defender
+// intercepting every file open can no longer hitch the UI - which is why the
+// overlay is ON by default again (config "eve_logs": "off" disables; "auto"
+// or absent auto-detects; anything else is an explicit logs path).
+//
 // Included by stoker-imgui.cpp AFTER the universe map globals (needs
-// load_universe()/g_sysid/g_sysname) and after bpos-dash.cpp (needs the
-// g_eve_logs_cfg/g_intel_channels_cfg config globals). Everything here runs
-// on the render thread only (throttled to one directory sweep per 2s).
+// load_universe()/g_sysid/g_sysname) and after bpos-dash.cpp (needs
+// g_run/spawn_bg and the g_eve_logs_cfg/g_intel_channels_cfg config globals).
 #pragma once
 
 #include <deque>
@@ -28,9 +37,18 @@ struct LogTail {
     time_t mtime = 0;
 };
 
+// render-thread copies (refreshed by eve_logs_scan; never touched by the worker)
 static std::vector<PilotLoc> g_pilots;
 static std::deque<IntelHit> g_intel;  // newest first, pruned to 30 min
-static std::string g_logs_dir;        // resolved Chatlogs dir; "" = not found
+
+// worker <-> render handoff
+static std::mutex g_logs_mtx;
+static std::vector<PilotLoc> g_pilots_shared;  // guarded by g_logs_mtx
+static std::deque<IntelHit> g_intel_shared;    // guarded by g_logs_mtx
+static std::atomic<int> g_logs_found{0};       // 0 searching, 1 found, -1 missing
+
+// worker-thread-only state
+static std::string g_logs_dir;  // resolved Chatlogs dir; "" = not found
 static std::map<std::string, LogTail> g_tails;
 
 // EVE chat logs are UTF-16LE with BOM
@@ -182,25 +200,13 @@ static bool is_intel_channel(const std::string& channel) {
     return lc.find("intel") != std::string::npos || lc.find(".imperium") != std::string::npos;
 }
 
-static void eve_logs_scan() {
-    // OPT-IN: the tail runs on the render thread and the per-file stats are
-    // expensive on Windows (Defender intercepts every open), so the whole
-    // feature stays dormant unless config.json sets "eve_logs" ("auto" to
-    // auto-detect the client's logs dir, or an explicit path)
-    if (g_eve_logs_cfg.empty()) return;
-    static time_t last_scan = 0, last_dirtry = 0, last_enum = 0;
-    static std::vector<std::string> live;  // files worth tailing this session
-    time_t nowt = time(nullptr);
-    if (nowt - last_scan < 2) return;
-    last_scan = nowt;
-    if (g_logs_dir.empty()) {
-        if (nowt - last_dirtry < 60) return;
-        last_dirtry = nowt;
-        logs_find_dir();
-        if (g_logs_dir.empty()) return;
-    }
+// one full sweep: enumerate (throttled), tail every live file, parse. Worker
+// thread only. Returns true when new intel landed (worth a GUI wake).
+static bool logs_sweep(std::vector<std::string>& live, time_t& last_enum,
+                       std::deque<IntelHit>& intel, std::map<std::string, LogTail>& tails) {
     load_universe();
     namespace fs = std::filesystem;
+    time_t nowt = time(nullptr);
     static const std::regex fname_re(R"(^(.*)_(\d{8})_(\d{6})(_\d+)?$)");
     static const std::regex line_re(R"(\[\s*([\d.]+)\s+([\d:]+)\s*\]\s*(.*?)\s*>\s*(.*))");
 
@@ -223,6 +229,7 @@ static void eve_logs_scan() {
         std::error_code ec;
         for (fs::directory_iterator it(g_logs_dir, ec), end; !ec && it != end;
              it.increment(ec)) {
+            if (!g_run) return false;   // shutdown: don't hold the join for a huge Chatlogs scan
             fs::path p = it->path();
             if (p.extension() != ".txt") continue;
             std::string stem;
@@ -237,16 +244,18 @@ static void eve_logs_scan() {
             std::string channel = fm[1].str();
             if (lower_(channel) != "local" && !is_intel_channel(channel)) continue;
             live.push_back(p.string());
-            g_tails[p.string()].channel = channel;
+            tails[p.string()].channel = channel;
         }
-        for (auto it2 = g_tails.begin(); it2 != g_tails.end();)  // drop aged-out tails
+        for (auto it2 = tails.begin(); it2 != tails.end();)  // drop aged-out tails
             it2 = std::find(live.begin(), live.end(), it2->first) == live.end()
-                      ? g_tails.erase(it2)
+                      ? tails.erase(it2)
                       : std::next(it2);
     }
 
+    bool fresh = false;
     std::error_code ec;
     for (auto& path : live) {
+        if (!g_run) return fresh;   // shutdown: bail between file tails
         fs::path p = path;
         auto ft = fs::last_write_time(p, ec);
         if (ec) continue;
@@ -256,7 +265,7 @@ static void eve_logs_scan() {
                         .count() +
                     nowt;
         if (nowt - mt > 12 * 3600) continue;  // stale session
-        LogTail& t = g_tails[path];
+        LogTail& t = tails[path];
         t.mtime = mt;
         std::string text = logs_read_new(p, t);
         if (text.empty()) continue;
@@ -274,6 +283,7 @@ static void eve_logs_scan() {
                         t.listener.erase(t.listener.begin());
                 }
             }
+            if (line.find("Channel MOTD:") != std::string::npos) continue;
             std::smatch m;
             if (!std::regex_search(line, m, line_re)) continue;
             std::string pilot = m[3].str(), msg = m[4].str();
@@ -297,28 +307,78 @@ static void eve_logs_scan() {
             }
             if (sys.empty()) continue;
             if (clr) {
-                for (auto iit = g_intel.begin(); iit != g_intel.end();)
-                    iit = iit->system == sys ? g_intel.erase(iit) : iit + 1;
+                for (auto iit = intel.begin(); iit != intel.end();)
+                    iit = iit->system == sys ? intel.erase(iit) : iit + 1;
                 continue;
             }
             // the line's own (UTC) timestamp: backfilled history must not
             // flash as if it were breaking news
             time_t at = chat_ts(m[1].str(), m[2].str());
-            g_intel.push_front({sys, t.channel, pilot, msg, at ? at : nowt});
+            if (!at) at = nowt;
+            // multiple clients in the same channel each write the line to
+            // their own log: identical text within 5s is one report (SMT rule)
+            bool dup = false;
+            for (auto& ih : intel)
+                if (ih.text == msg && std::llabs((long long)(ih.at - at)) < 5) {
+                    dup = true;
+                    break;
+                }
+            if (dup) continue;
+            intel.push_front({sys, t.channel, pilot, msg, at});
+            fresh = true;
         }
     }
-    while (g_intel.size() > 40 || (!g_intel.empty() && nowt - g_intel.back().at > 1800))
-        g_intel.pop_back();
-    // pilot list: newest Local session per listener
-    std::map<std::string, PilotLoc> best;
-    for (auto& kv : g_tails) {
-        LogTail& t = kv.second;
-        if (lower_(t.channel) != "local" || t.cur_sys.empty()) continue;
-        if (nowt - t.mtime > 12 * 3600) continue;
-        std::string who = t.listener.empty() ? "pilot" : t.listener;
-        auto& b = best[who];
-        if (t.mtime >= b.at) b = {who, t.cur_sys, t.mtime};
+    while (intel.size() > 40 || (!intel.empty() && nowt - intel.back().at > 1800))
+        intel.pop_back();
+    return fresh;
+}
+
+// the watcher thread: SMT's LogFileCacheTrigger loop, 1500ms cadence. Started
+// from main (GUI only), joined at shutdown via the 100ms g_run slices.
+static void eve_logs_worker() {
+    if (lower_(g_eve_logs_cfg) == "off") return;
+    time_t last_dirtry = 0, last_enum = 0;
+    std::vector<std::string> live;
+    std::deque<IntelHit> intel;  // worker-owned working set
+    while (g_run) {
+        if (g_logs_dir.empty()) {
+            time_t nowt = time(nullptr);
+            if (!last_dirtry || nowt - last_dirtry >= 60) {
+                last_dirtry = nowt;
+                logs_find_dir();
+                g_logs_found = g_logs_dir.empty() ? -1 : 1;
+            }
+        }
+        if (!g_logs_dir.empty()) {
+            bool fresh = logs_sweep(live, last_enum, intel, g_tails);
+            // pilot list: newest Local session per listener
+            time_t nowt = time(nullptr);
+            std::map<std::string, PilotLoc> best;
+            for (auto& kv : g_tails) {
+                LogTail& t = kv.second;
+                if (lower_(t.channel) != "local" || t.cur_sys.empty()) continue;
+                if (nowt - t.mtime > 12 * 3600) continue;
+                std::string who = t.listener.empty() ? "pilot" : t.listener;
+                auto& b = best[who];
+                if (t.mtime >= b.at) b = {who, t.cur_sys, t.mtime};
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_logs_mtx);
+                g_intel_shared = intel;
+                g_pilots_shared.clear();
+                for (auto& kv : best) g_pilots_shared.push_back(kv.second);
+            }
+            if (fresh && g_gui_wake) g_gui_wake();  // repaint for the red ring
+        }
+        for (int i = 0; i < 15 && g_run; i++)  // 1500ms, quick to shut down
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    g_pilots.clear();
-    for (auto& kv : best) g_pilots.push_back(kv.second);
+}
+
+// render thread: just adopt the worker's latest results. No filesystem work
+// here, ever - that is the whole point.
+static void eve_logs_scan() {
+    std::lock_guard<std::mutex> lk(g_logs_mtx);
+    g_intel = g_intel_shared;
+    g_pilots = g_pilots_shared;
 }

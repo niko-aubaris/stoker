@@ -12,6 +12,7 @@
 // Include AFTER run_cmd/urlenc/parse_iso in bpos-dash.cpp (single-TU project).
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +62,8 @@ static int winhttp_req(const std::string& url, const wchar_t* method,
                        const std::string& bearer, const std::string& body,
                        const wchar_t* ctype, std::string& out, json* headers_out) {
     out.clear();
+    // shutting down: fail fast so mid-sweep joins don't block the window close
+    if (!g_run) return 0;
     URL_COMPONENTSW uc{};
     uc.dwStructSize = sizeof uc;
     wchar_t host[256] = {0}, path[2048] = {0};
@@ -153,7 +156,8 @@ static const char* SCOPE =
     "esi-corporations.read_structures.v1 esi-assets.read_corporation_assets.v1 "
     "esi-industry.read_corporation_mining.v1 esi-characters.read_notifications.v1 "
     "esi-structures.read_corporation.v1 esi-ui.write_waypoint.v1 "
-    "esi-characters.read_corporation_roles.v1 esi-characters.read_titles.v1";
+    "esi-characters.read_corporation_roles.v1 esi-characters.read_titles.v1 "
+    "esi-corporations.read_starbases.v1";
 
 // the new-generation ESI endpoints (skyhooks, sov hubs) only exist behind a
 // compatibility date; the legacy /latest tree does not carry them
@@ -171,11 +175,19 @@ static std::string g_history_api = "https://api.escalateanyways.com/market/stoke
 // empty URL = off.
 static std::string g_rentals_api, g_rentals_token;
 static long long g_rentals_corp = 98695839;  // SOUSN
+// Metenox monthly economics endpoint (same service + token as rentals);
+// derived from rentals_api when the config doesn't name it explicitly
+static std::string g_econ_api;
 
 // Skyhook watch feed (watchlist + income + live theft windows + raid stats),
 // served by the corp backend. config "skyhooks_api"; empty = off. Shown on
 // the same corp tab as the rentals feed.
 static std::string g_skyhooks_api;
+// Backend-free variant: config "skyhook_watchlist" = an array of
+// {planet_id, system, planet_roman, hourly_isk, monthly_rent_isk} objects.
+// Theft windows come straight from the public raidable feed (no auth), so
+// this needs no server at all; takes precedence over "skyhooks_api".
+static json g_skyhook_watchlist = json::array();
 
 // --- sha256 (for the PKCE code challenge) -----------------------------------
 struct Sha256 {
@@ -404,6 +416,8 @@ static std::string win_system_proxy() {
 #endif
 
 static std::string run_curl(const std::string& args) {
+    // shutting down: fail fast so mid-sweep joins don't block the window close
+    if (!g_run) return "";
     std::string out = run_cmd(("curl -s " + curl_flags() + args + QUIET).c_str());
 #ifdef _WIN32
     if (out.empty()) {
@@ -482,20 +496,24 @@ static std::string http_post_form(const std::string& url, const std::string& bod
     return out;
 }
 
-static std::string http_post_json(const std::string& url, const std::string& body) {
+static std::string http_post_json(const std::string& url, const std::string& body,
+                                  const std::string& bearer = "") {
     // body goes through a temp file: JSON is full of double quotes, which a
     // double-quoted shell argument cannot carry (and @file keeps the payload
     // off the process command line)
     auto tmp = config_dir() / ("post-" + random_token(6) + ".json");
     { std::ofstream f(tmp); f << body; }
+    std::string auth = bearer.empty()
+        ? std::string()
+        : "-H \"Authorization: Bearer " + bearer + "\" ";
     std::string out = run_curl("--compressed --max-time 20 -X POST "
-                                "-H \"Content-Type: application/json\" "
+                                "-H \"Content-Type: application/json\" " + auth +
                                 "--data @\"" + tmp.string() + "\" \"" + url + "\"");
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
 #ifdef _WIN32
     if (out.empty())
-        winhttp_req(url, L"POST", "", body, L"application/json", out, nullptr);
+        winhttp_req(url, L"POST", bearer, body, L"application/json", out, nullptr);
 #endif
     return out;
 }
@@ -607,11 +625,23 @@ static bool open_browser(const std::string& url) {
 #endif
 }
 
+// An abandoned browser login (tab closed, no character picked) used to hold
+// the listener for its full 3-minute timeout; bumping the generation makes
+// the pending wait_for_callback give up within a second so a fresh login can
+// take the port immediately. login_pending() tells the UI a login (not a
+// data refresh) is what the busy flag is holding.
+static std::atomic<int> g_login_gen{0};
+static std::atomic<bool> g_login_pending{false};
+static bool login_pending() { return g_login_pending.load(); }
+static void cancel_pending_login() { g_login_gen++; }
+
 // Blocks until the browser hits /callback; returns the auth code ("" on error).
 // Gives up after timeout_s so an abandoned login can't wedge the caller (and
-// can't hold the port against the next attempt).
+// can't hold the port against the next attempt). err is "cancelled" when
+// cancel_pending_login() aborted the wait (the caller stays quiet about it).
 static std::string wait_for_callback(const std::string& expect_state, std::string& err,
                                      int timeout_s = 180) {
+    const int my_gen = g_login_gen.load();
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { err = "WSAStartup failed"; return ""; }
@@ -635,19 +665,24 @@ static std::string wait_for_callback(const std::string& expect_state, std::strin
     }
     time_t deadline = time(nullptr) + timeout_s;
     std::string code;
-    for (int tries = 0; tries < 32 && code.empty(); tries++) {
-        // wait for a connection, but never past the deadline
+    int conns = 0;
+    while (code.empty() && conns < 32) {
+        if (g_login_gen.load() != my_gen) { err = "cancelled"; break; }
+        // wait for a connection in 1s slices (so a cancel lands fast), but
+        // never past the deadline
         long left = (long)(deadline - time(nullptr));
         if (left <= 0) { err = "login timed out (nothing came back from the browser)"; break; }
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(srv, &rd);
         timeval tv{};
-        tv.tv_sec = left;
+        tv.tv_sec = 1;
         int sr = select((int)srv + 1, &rd, nullptr, nullptr, &tv);
-        if (sr <= 0) { err = "login timed out (nothing came back from the browser)"; break; }
+        if (sr < 0) { err = "login timed out (nothing came back from the browser)"; break; }
+        if (sr == 0) continue;  // slice elapsed; re-check cancel + deadline
         sock_t c = accept(srv, nullptr, nullptr);
         if (c == INVALID_SOCKET) break;
+        conns++;
         std::string req;
         char buf[4096];
         // request line + headers arrive in one or two reads for a local socket
@@ -747,7 +782,9 @@ static bool login(const std::string& client_id, std::string& err,
     say("waiting for the login to come back on localhost:" +
         std::to_string(CALLBACK_PORT) + " ...");
 
+    g_login_pending = true;
     std::string code = wait_for_callback(state, err);
+    g_login_pending = false;
     if (code.empty()) { if (err.empty()) err = "no auth code received"; return false; }
 
     std::string body = "grant_type=authorization_code&code=" + urlenc(code) +
@@ -941,6 +978,33 @@ static double fuel_per_day(const std::string& type_name, const json& services) {
 
 // --- the fetch: one corp's structures straight off ESI ------------------------
 // Returns /bpos-shaped JSON, or "" with err set (keeps the last table on screen).
+// "SYSTEM - VI-20" -> planet 6, moon 20: the corp's Metenox naming convention
+// carries the moon designation, which is the join key into the moon catalog
+static bool parse_moon_tag(const std::string& name, int& planet, int& moonno) {
+    size_t p = name.rfind(" - ");
+    if (p == std::string::npos) return false;
+    std::string tail = name.substr(p + 3);
+    size_t d = tail.find('-');
+    if (d == std::string::npos || d == 0 || d + 1 >= tail.size()) return false;
+    int v = 0, prev = 0;
+    for (size_t i = 0; i < d; i++) {  // roman planet numeral
+        char c = tail[i];
+        int x = c == 'I' ? 1 : c == 'V' ? 5 : c == 'X' ? 10 : c == 'L' ? 50 : 0;
+        if (!x) return false;
+        v += x;
+        if (prev && prev < x) v -= 2 * prev;  // subtractive pairs (IV, IX, ...)
+        prev = x;
+    }
+    long long m = 0;
+    for (size_t i = d + 1; i < tail.size(); i++) {
+        if (!isdigit((unsigned char)tail[i])) return false;
+        m = m * 10 + (tail[i] - '0');
+    }
+    planet = v;
+    moonno = (int)m;
+    return planet > 0 && moonno > 0;
+}
+
 // pulls a "key: &anchor 12345" style value out of a notification's YAML text
 static long long yaml_ll(const std::string& text, const std::string& key) {
     size_t p = text.find(key + ":");
@@ -956,6 +1020,42 @@ static long long yaml_ll(const std::string& text, const std::string& key) {
     long long v = 0;
     while (p < text.size() && isdigit((unsigned char)text[p])) v = v * 10 + (text[p++] - '0');
     return v;
+}
+
+// --- POS control towers --------------------------------------------------------
+// Hourly upkeep from the tower's name; reproduces invControlTowerResources
+// exactly (re-verified against the SDE 2026-08-20). Base large = 40 blocks/hr,
+// medium/small scale by half/quarter; faction hulls (Blood/Guristas/Sansha/
+// Serpentis/Angel) burn 10% less (36) and pirate elite hulls (Dark Blood/Dread
+// Guristas/True Sansha/Shadow/Domination) 20% less (32). Strontium (reinforce
+// upkeep) is 400/hr on a large regardless of faction, scaled by size the same way.
+static bool pos_fuel_rate(const std::string& tower, double& blocks_hr,
+                          double& stront_hr) {
+    if (tower.find("Control Tower") == std::string::npos) return false;
+    double base = 40;
+    for (const char* f : {"Dark Blood", "Dread Guristas", "True Sansha",
+                          "Domination", "Shadow"})
+        if (tower.rfind(f, 0) == 0) base = 32;
+    if (base == 40)
+        for (const char* f : {"Blood", "Guristas", "Sansha", "Serpentis", "Angel"})
+            if (tower.rfind(f, 0) == 0) base = 36;
+    double size = tower.find("Small") != std::string::npos    ? 0.25
+                  : tower.find("Medium") != std::string::npos ? 0.5
+                                                              : 1.0;
+    blocks_hr = base * size;
+    stront_hr = 400 * size;
+    return true;
+}
+
+// which race's tower art a hull wears (pirate factions map to their lore parent)
+static const char* pos_race_of(const std::string& tower) {
+    for (const char* f : {"Amarr", "Blood", "Dark Blood", "Sansha", "True Sansha"})
+        if (tower.rfind(f, 0) == 0) return "amarr";
+    for (const char* f : {"Caldari", "Guristas", "Dread Guristas"})
+        if (tower.rfind(f, 0) == 0) return "caldari";
+    for (const char* f : {"Gallente", "Serpentis", "Shadow"})
+        if (tower.rfind(f, 0) == 0) return "gallente";
+    return "minmatar";  // Minmatar / Angel / Domination
 }
 
 static std::string fetch_corp(const std::string& tok, long long corp_id,
@@ -1013,6 +1113,7 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
     // anything short of that 403s and the column shows "?".
     std::map<long long, double> gas_at, ozone_at;
     std::map<long long, std::map<long long, double>> goo_at;  // structure -> type -> qty
+    std::map<long long, long long> rig_at;  // structure -> fitted moon drilling rig type
     bool assets_ok = false;
     std::string fuel2_status = "off";  // ok | relogin | director | error | off
     if (!token_has_scope(tok, "esi-assets.read_corporation_assets.v1")) {
@@ -1043,6 +1144,10 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                     else if (tid == 16273) ozone_at[loc] += q;  // Liquid Ozone
                 } else if (flag == "MoonMaterialBay") {
                     goo_at[loc][tid] += q;  // mined moongoo output
+                } else if (flag.rfind("RigSlot", 0) == 0 &&
+                           (tid == 46325 || tid == 46326 ||   // M-Set Drilling Stability I/II
+                            tid == 46327 || tid == 46328)) {  // L-Set Drilling Proficiency I/II
+                    rig_at[loc] = tid;  // stretches the fire window + popped field life
                 }
             }
             if (page == 1 && ahdr.value("x-pages", std::string()) != "")
@@ -1100,8 +1205,11 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
 
     // Athanor/Tatara moon-pull schedule. Needs esi-industry.read_corporation_mining.v1
     // on the token (in the default SCOPE since v2.5.0; the shared dev app allows
-    // it - tokens minted earlier need a re-login).
-    std::map<long long, std::pair<std::string, std::string>> extr;  // sid -> start, arrival
+    // it - tokens minted earlier need a re-login). natural_decay_time is the
+    // server-computed auto-fracture moment (chunk arrival + ~3h fire window,
+    // already stretched by any drilling rig), so the UI never guesses it.
+    struct Extr { std::string start, arrival, decay; };
+    std::map<long long, Extr> extr;  // sid -> newest schedule
     bool extr_ok = false;
     if (token_has_scope(tok, "esi-industry.read_corporation_mining.v1")) {
         int xst = 0;
@@ -1116,8 +1224,9 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
                 for (auto& e : xj) {
                     long long esid = e.value("structure_id", 0LL);
                     std::string arr = e.value("chunk_arrival_time", "");
-                    if (arr > extr[esid].second)  // newest schedule wins (ISO sorts)
-                        extr[esid] = {e.value("extraction_start_time", ""), arr};
+                    if (arr > extr[esid].arrival)  // newest schedule wins (ISO sorts)
+                        extr[esid] = {e.value("extraction_start_time", ""), arr,
+                                      e.value("natural_decay_time", "")};
                 }
             }
         } catch (...) {}
@@ -1160,8 +1269,10 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         if (extr_ok) {
             auto eit = extr.find(s.value("structure_id", 0LL));
             if (eit != extr.end()) {
-                r["extraction_start"] = eit->second.first;
-                r["chunk_arrival"] = eit->second.second;
+                r["extraction_start"] = eit->second.start;
+                r["chunk_arrival"] = eit->second.arrival;
+                if (!eit->second.decay.empty())
+                    r["natural_decay"] = eit->second.decay;
             }
         }
         std::string svc;
@@ -1212,6 +1323,16 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         if (assets_ok) {
             long long sid = r["structure_id"].get<long long>();
             std::string ty = r["type"].get<std::string>();
+            if (ty == "Athanor" || ty == "Tatara") {
+                // fitted moon drilling rig from the same corp-assets sweep;
+                // tier 0 = confirmed bare (assets were readable, no rig found)
+                long long rt = rig_at.count(sid) ? rig_at[sid] : 0;
+                r["drill_rig_tier"] = rt == 0 ? 0 : (rt == 46326 || rt == 46328) ? 2 : 1;
+                if (rt == 46325) r["drill_rig"] = "M-Set Moon Drilling Stability I";
+                else if (rt == 46326) r["drill_rig"] = "M-Set Moon Drilling Stability II";
+                else if (rt == 46327) r["drill_rig"] = "L-Set Moon Drilling Proficiency I";
+                else if (rt == 46328) r["drill_rig"] = "L-Set Moon Drilling Proficiency II";
+            }
             if (ty == "Metenox Moon Drill")
                 r["fuel2_units"] = gas_at.count(sid) ? gas_at[sid] : 0.0;
             else if (ty.rfind("Ansiblex", 0) == 0 || ty.rfind("Pharolux", 0) == 0)
@@ -1247,6 +1368,221 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         }
         out["structures"].push_back(std::move(r));
     }
+
+    // --- POS control towers: the classic starbases, Director-gated. The list
+    // endpoint gives hull/moon/state, the per-tower detail gives the actual
+    // fuel bay (blocks + strontium). CCP ships no fuel_expires for towers, so
+    // one is synthesized from stock / burn rate - every clock, gauge and
+    // refuel tracker downstream then works unchanged. Towers in systems where
+    // the corp's alliance holds sovereignty burn 25% less (nullsec only).
+    std::string pos_status = "off";
+    if (!token_has_scope(tok, "esi-corporations.read_starbases.v1")) {
+        if (g_scopes.find("read_starbases") != std::string::npos)
+            pos_status = "relogin";  // we ask for it now; this token predates that
+    } else {
+        json towers = json::array(), phdr = json::object();
+        int pst = 0;
+        pos_status = "ok";
+        for (int page = 1, pages = 1; page <= pages && page <= 10; page++) {
+            json* h = page == 1 ? &phdr : nullptr;
+            std::string body = http_get(ESI + std::string("/corporations/") +
+                                            std::to_string(corp_id) +
+                                            "/starbases/?datasource=tranquility&page=" +
+                                            std::to_string(page),
+                                        tok, pst, h);
+            if (pst != 200) {
+                pos_status = pst == 403 ? "director" : "error";
+                break;
+            }
+            json j;
+            try { j = json::parse(body); } catch (...) { pos_status = "error"; break; }
+            if (!j.is_array()) { pos_status = "error"; break; }
+            for (auto& t : j) towers.push_back(t);
+            if (page == 1 && phdr.value("x-pages", std::string()) != "")
+                pages = std::atoi(phdr["x-pages"].get<std::string>().c_str());
+        }
+        if (pos_status == "ok" && !towers.empty()) {
+            // tower hull + system names (the structures pull above resolved
+            // only its own ids)
+            std::vector<long long> pids;
+            for (auto& t : towers) {
+                for (long long id : {t.value("type_id", 0LL), t.value("system_id", 0LL)})
+                    if (id && !names.count(id) &&
+                        std::find(pids.begin(), pids.end(), id) == pids.end())
+                        pids.push_back(id);
+            }
+            if (!pids.empty()) try {
+                std::string body = "[";
+                for (size_t i = 0; i < pids.size(); i++)
+                    body += (i ? "," : "") + std::to_string(pids[i]);
+                body += "]";
+                json r = json::parse(http_post_json(
+                    ESI + std::string("/universe/names/?datasource=tranquility"), body));
+                for (auto& e : r) names[e.value("id", 0LL)] = e.value("name", "");
+            } catch (...) {}
+            // moon names: /universe/names does not resolve moons, so each one
+            // is a single lookup - cached for the process lifetime (they never
+            // change), placeholder-claimed so parallel corp sweeps skip it
+            static std::mutex s_pos_mtx;
+            static std::map<long long, std::string> s_moon_name;
+            static std::map<long long, long long> s_corp_ally;   // corp -> alliance
+            static std::map<long long, long long> s_sov;         // system -> sov alliance
+            static time_t s_sov_at = 0;
+            std::vector<long long> want_moons;
+            bool need_sov = false;
+            {
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                for (auto& t : towers) {
+                    long long m = t.value("moon_id", 0LL);
+                    if (m && !s_moon_name.count(m)) {
+                        s_moon_name[m] = "";  // claim
+                        want_moons.push_back(m);
+                    }
+                }
+                if (now - s_sov_at > 6 * 3600) {
+                    s_sov_at = now;
+                    need_sov = true;
+                }
+            }
+            for (long long m : want_moons) try {
+                json mj = json::parse(http_get_body(ESI + std::string("/universe/moons/") +
+                                                    std::to_string(m) +
+                                                    "/?datasource=tranquility"));
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                s_moon_name[m] = mj.value("name", "");
+            } catch (...) {
+                // transient failure: drop our "" claim so the next sweep retries,
+                // instead of caching the empty name for the process lifetime.
+                // This round still falls back to "<system> POS" below.
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                s_moon_name.erase(m);
+            }
+            if (need_sov) try {
+                json sj = json::parse(http_get_body(
+                    ESI + std::string("/sovereignty/map/?datasource=tranquility")));
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                s_sov.clear();
+                for (auto& e : sj) {
+                    long long a = e.value("alliance_id", 0LL);
+                    if (a) s_sov[e.value("system_id", 0LL)] = a;
+                }
+            } catch (...) {
+                // sov discount is best-effort (base rate this round), but a failed
+                // fetch must not hold the 6h stamp: reset so the next sweep retries.
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                s_sov_at = 0;
+            }
+            long long ally = 0;
+            bool have_ally = false;
+            {
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                auto it = s_corp_ally.find(corp_id);
+                if (it != s_corp_ally.end()) { ally = it->second; have_ally = true; }
+            }
+            if (!have_ally) {
+                try {
+                    json cj = json::parse(http_get_body(ESI + std::string("/corporations/") +
+                                                        std::to_string(corp_id) +
+                                                        "/?datasource=tranquility"));
+                    ally = cj.value("alliance_id", 0LL);
+                } catch (...) {}
+                std::lock_guard<std::mutex> pl(s_pos_mtx);
+                s_corp_ally[corp_id] = ally;
+            }
+            for (auto& t : towers) {
+                long long sid = t.value("starbase_id", 0LL);
+                long long sysid = t.value("system_id", 0LL);
+                long long moonid = t.value("moon_id", 0LL);
+                if (!sid) continue;
+                std::string tower = names.count(t.value("type_id", 0LL))
+                                        ? names[t.value("type_id", 0LL)]
+                                        : "Control Tower";
+                std::string state = t.value("state", "");
+                if (state == "reinforcing") state = "reinforced";  // older spec spelling
+                double blocks_hr = 0, stront_hr = 0;
+                pos_fuel_rate(tower, blocks_hr, stront_hr);
+                bool sov = false;
+                {
+                    std::lock_guard<std::mutex> pl(s_pos_mtx);
+                    sov = ally && s_sov.count(sysid) && s_sov[sysid] == ally;
+                }
+                if (sov) blocks_hr *= 0.75;
+                // the actual bay: fuel blocks + strontium from the tower detail
+                double blocks = -1, stront = -1;
+                try {
+                    int dst = 0;
+                    json det = json::parse(http_get(
+                        ESI + std::string("/corporations/") + std::to_string(corp_id) +
+                            "/starbases/" + std::to_string(sid) +
+                            "/?datasource=tranquility&system_id=" + std::to_string(sysid),
+                        tok, dst));
+                    if (dst == 200 && det.contains("fuels") && det["fuels"].is_array()) {
+                        // an empty fuels array is a real answer: the bay is empty
+                        blocks = 0;
+                        stront = 0;
+                        for (auto& f : det["fuels"]) {
+                            long long ft = f.value("type_id", 0LL);
+                            double q = f.value("quantity", 0.0);
+                            if (ft == 16275) stront += q;
+                            else if (ft == 4051 || ft == 4246 || ft == 4247 || ft == 4312)
+                                blocks += q;
+                        }
+                    }
+                } catch (...) { /* bay stays unknown; the row still renders */ }
+                json r;
+                r["structure_id"] = sid;
+                r["is_pos"] = true;
+                r["pos_race"] = pos_race_of(tower);
+                r["moon_id"] = moonid;  // tower attack notifications match by moon
+                std::string sys = names.count(sysid) ? names[sysid] : "";
+                std::string mname;
+                {
+                    std::lock_guard<std::mutex> pl(s_pos_mtx);
+                    if (moonid && s_moon_name.count(moonid)) mname = s_moon_name[moonid];
+                }
+                r["name"] = !mname.empty() ? mname : sys + " POS";
+                r["system"] = sys;
+                r["type"] = tower;  // display_type() shortens to "POS" client-side
+                r["state"] = state;
+                if (t.contains("reinforced_until") && t["reinforced_until"].is_string())
+                    r["state_timer_end"] = t["reinforced_until"];
+                if (t.contains("unanchor_at") && t["unanchor_at"].is_string())
+                    r["unanchors_at"] = t["unanchor_at"];
+                r["pos_sov"] = sov;
+                double bpd = blocks_hr * 24;
+                r["blocks_per_day"] = bpd;
+                if (stront >= 0) {
+                    r["pos_stront"] = stront;
+                    if (stront_hr > 0) r["pos_stront_hours"] = stront / stront_hr;
+                }
+                if (blocks >= 0) {
+                    r["blocks_now"] = blocks;
+                    r["m3_now"] = blocks * 5;
+                    // offline/unanchoring towers burn nothing: no fuel clock,
+                    // the client badges them instead of counting them down
+                    if (state == "online" && blocks_hr > 0) {
+                        double days = blocks / bpd;
+                        time_t fe = now + (time_t)llround(blocks / blocks_hr * 3600.0);
+                        std::tm fe_tm{};
+#ifdef _WIN32
+                        gmtime_s(&fe_tm, &fe);
+#else
+                        gmtime_r(&fe, &fe_tm);
+#endif
+                        char fe_iso[32];
+                        std::strftime(fe_iso, sizeof fe_iso, "%Y-%m-%dT%H:%M:%SZ", &fe_tm);
+                        r["fuel_expires"] = fe_iso;
+                        r["fuel_days_left"] = days;
+                        double need = std::max(0.0, std::round((30 - days) * bpd));
+                        r["blocks_to_30d"] = need;
+                        r["m3_to_30d"] = need * 5;
+                    }
+                }
+                out["structures"].push_back(std::move(r));
+            }
+        }
+    }
+    out["starbases_status"] = pos_status;
 
     // persistent refuel log via the history service: report what this poll
     // saw, read back everything the server has accumulated for this corp
@@ -1297,10 +1633,86 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             }
         } catch (...) { /* classification is best-effort */ }
     }
-    // the corp's watched skyhooks ride along on the same tab. The character's
-    // own token goes along as the bearer; the backend decides per-character
-    // access server-side, so a non-200 here simply means no skyhook rows.
-    if (corp_id == g_rentals_corp && !g_skyhooks_api.empty()) {
+    // Metenox monthly economics: moon parsed from the corp's naming convention
+    // ("SYSTEM - VI-20"), valued by the moon-rental API (moon-calc composition
+    // DB + market-bot prices). Goo - alliance rent - fuel blocks - magmatic = net.
+    if (corp_id == g_rentals_corp && !g_econ_api.empty()) {
+        json want = json::array();
+        for (auto& r : out["structures"]) {
+            if (r.value("type", "") != "Metenox Moon Drill") continue;
+            int planet = 0, moonno = 0;
+            if (!parse_moon_tag(r.value("name", ""), planet, moonno)) continue;
+            want.push_back({{"system", r.value("system", "")},
+                            {"planet", planet},
+                            {"moon", moonno}});
+        }
+        if (!want.empty()) try {
+            json rj = json::parse(http_post_json(
+                g_econ_api, json{{"moons", want}}.dump(), g_rentals_token));
+            std::map<std::string, json> by_moon;
+            if (rj.contains("moons") && rj["moons"].is_array())
+                for (auto& e : rj["moons"])
+                    if (e.value("found", false)) {
+                        // uppercase the key exactly like the lookup below, so the
+                        // join survives whatever casing the server echoes back
+                        std::string ksys = e.value("system", "");
+                        for (auto& c : ksys) c = (char)toupper((unsigned char)c);
+                        by_moon[ksys + "|" +
+                                std::to_string(e.value("planet", 0)) + "|" +
+                                std::to_string(e.value("moon", 0))] = e;
+                    }
+            for (auto& r : out["structures"]) {
+                if (r.value("type", "") != "Metenox Moon Drill") continue;
+                int planet = 0, moonno = 0;
+                if (!parse_moon_tag(r.value("name", ""), planet, moonno)) continue;
+                std::string sys = r.value("system", "");
+                for (auto& c : sys) c = (char)toupper((unsigned char)c);
+                auto it = by_moon.find(sys + "|" + std::to_string(planet) + "|" +
+                                       std::to_string(moonno));
+                if (it == by_moon.end()) continue;
+                r["econ_goo"] = it->second.value("goo", 0.0);
+                r["econ_rent"] = it->second.value("rent", 0.0);
+                r["econ_fuel"] = it->second.value("fuel_blocks", 0.0);
+                r["econ_gas"] = it->second.value("magmatic", 0.0);
+                r["econ_net"] = it->second.value("net", 0.0);
+            }
+        } catch (...) { /* economics are best-effort; the table never waits */ }
+    }
+    // the corp's watched skyhooks ride along on the same tab. Watchlist mode
+    // is self-contained: the hooks come from config and their theft windows
+    // from the public game-wide raidable feed (no auth), matched by planet id.
+    // The compatibility date must ride as a query param - the header alone
+    // 404s on the new-generation endpoints since ~Aug 2026.
+    if (corp_id == g_rentals_corp && !g_skyhook_watchlist.empty()) {
+        json hooks = json::array();
+        for (auto& w : g_skyhook_watchlist)
+            if (w.is_object() && w.value("planet_id", 0LL)) hooks.push_back(w);
+        try {
+            int rst = 0;
+            json feed = json::parse(
+                http_get("https://esi.evetech.net/skyhooks/raidable"
+                         "?compatibility_date=2026-06-01",
+                         "", rst, nullptr, COMPAT_HDR));
+            if (rst == 200 && feed.contains("skyhooks") && feed["skyhooks"].is_array())
+                for (auto& e : feed["skyhooks"]) {
+                    long long pid = e.value("planet_id", 0LL);
+                    if (!pid || !e.contains("theft_vulnerability") ||
+                        !e["theft_vulnerability"].is_object())
+                        continue;
+                    for (auto& h : hooks)
+                        if (h.value("planet_id", 0LL) == pid) {
+                            h["window_start"] =
+                                e["theft_vulnerability"].value("start", "");
+                            h["window_end"] =
+                                e["theft_vulnerability"].value("end", "");
+                        }
+                }
+        } catch (...) { /* windows are best-effort; the rows still render */ }
+        out["skyhooks"] = std::move(hooks);
+    } else if (corp_id == g_rentals_corp && !g_skyhooks_api.empty()) {
+        // legacy corp-backend feed; the character's own token goes along as
+        // the bearer and the backend decides per-character access, so a
+        // non-200 here simply means no skyhook rows.
         try {
             int kst = 0;
             json kj = json::parse(http_get(g_skyhooks_api, tok, kst));
@@ -1408,9 +1820,11 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
             row["est"] = true;
         }
 
-    // structure notifications: a much faster signal than the hourly corp
-    // structures dataset (attacks land within ~10 min, plus anchoring and
-    // destruction events the list itself won't show until the next roll)
+    // structure + moonmining notifications: a much faster signal than the
+    // hourly corp structures dataset (attacks land within ~10 min, plus
+    // anchoring/destruction events the list itself won't show until the next
+    // roll, and the actual chunk-fracture moment: MoonminingLaserFired names
+    // who pressed the button, MoonminingAutomaticFracture is the 3h timeout)
     if (char_id && token_has_scope(tok, "esi-characters.read_notifications.v1")) {
         int nst = 0;
         std::string nb = http_get(ESI + std::string("/characters/") +
@@ -1420,15 +1834,47 @@ static std::string fetch_corp(const std::string& tok, long long corp_id,
         if (nst == 200) try {
             json nj = json::parse(nb);
             json outn = json::array();
+            std::vector<long long> fired_ids;
             for (auto& n : nj) {
                 std::string ty = n.value("type", "");
-                if (ty.rfind("Structure", 0) != 0) continue;
+                bool moon = ty.rfind("Moonmining", 0) == 0;
+                // TowerAlertMe etc: POS attacks carry a moonID, not a structureID
+                bool pos = ty.rfind("Tower", 0) == 0;
+                if (!moon && !pos && ty.rfind("Structure", 0) != 0) continue;
                 std::string text = n.value("text", "");
-                outn.push_back({{"type", ty},
-                                {"timestamp", n.value("timestamp", "")},
-                                {"structure_id", yaml_ll(text, "structureID")},
-                                {"system_id", yaml_ll(text, "solarsystemID")}});
+                json e = {{"type", ty},
+                          {"timestamp", n.value("timestamp", "")},
+                          {"structure_id", yaml_ll(text, "structureID")},
+                          // moonmining/tower YAML capitalizes the S the structure ones don't
+                          {"system_id", yaml_ll(text, (moon || pos) ? "solarSystemID"
+                                                                    : "solarsystemID")}};
+                if (pos) e["moon_id"] = yaml_ll(text, "moonID");
+                if (ty == "MoonminingLaserFired") {
+                    long long fb = yaml_ll(text, "firedBy");
+                    if (fb) {
+                        e["fired_by"] = fb;
+                        fired_ids.push_back(fb);
+                    }
+                }
+                outn.push_back(std::move(e));
             }
+            // who fired the laser, by name (public lookup, best-effort)
+            if (!fired_ids.empty()) try {
+                std::sort(fired_ids.begin(), fired_ids.end());
+                fired_ids.erase(std::unique(fired_ids.begin(), fired_ids.end()),
+                                fired_ids.end());
+                std::string body = "[";
+                for (size_t i = 0; i < fired_ids.size(); i++)
+                    body += (i ? "," : "") + std::to_string(fired_ids[i]);
+                body += "]";
+                json r = json::parse(http_post_json(
+                    ESI + std::string("/universe/names/?datasource=tranquility"), body));
+                std::map<long long, std::string> who;
+                for (auto& e : r) who[e.value("id", 0LL)] = e.value("name", "");
+                for (auto& e : outn)
+                    if (e.contains("fired_by") && who.count(e["fired_by"].get<long long>()))
+                        e["fired_by_name"] = who[e["fired_by"].get<long long>()];
+            } catch (...) {}
             out["notifications"] = outn;
             out["notifications_ok"] = true;
         } catch (...) {}

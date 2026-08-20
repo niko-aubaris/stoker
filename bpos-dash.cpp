@@ -29,6 +29,8 @@
 #include <ctime>
 #include <iostream>
 #include <mutex>
+#include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -107,9 +109,17 @@ struct Row {
     double fuel2 = -1;                // stock units; -1 = source can't see the bay
     std::string rental, renter;       // moon-rental class: corp|private|unknown, "" = n/a
     double goo_m3 = -1, goo_cap = -1, goo_isk = -1;  // Metenox moon material bay
+    bool has_econ = false;            // monthly Metenox economics resolved
+    double econ_goo = 0, econ_rent = 0, econ_fuel = 0, econ_gas = 0, econ_net = 0;
     std::vector<GooItem> goo;         // bay contents by value, priced at market avg
     std::string state_timer_start, state_timer_end;  // reinforcement clock (ISO)
     std::string extraction_start, chunk_arrival;     // Athanor/Tatara moon pull (ISO)
+    std::string natural_decay;        // auto-fracture moment (ISO); "" = feed can't say
+    std::string drill_rig;            // fitted moon drilling rig name, "" = none
+    int drill_rig_tier = -1;          // -1 = no corp-assets view, 0 = bare, 1/2 = rig tier
+    time_t popped_at = 0;             // actual fracture seen in notifications; 0 = none
+    bool popped_manual = false;       // laser fired by hand vs the 3h auto timeout
+    std::string popped_by;            // who pressed the button (manual pops)
     std::string unanchors_at;         // set while unanchoring (ISO)
     int sv_on = -1, sv_off = -1;      // service counts; -1 = feed doesn't say
     bool is_skyhook = false;          // watched skyhook row (no fuel, theft windows)
@@ -121,8 +131,18 @@ struct Row {
     double sky_unsec_m3 = -1, sky_unsec_isk = -1;  // raidable (surplus) bay
     double sky_sec_m3 = -1, sky_sec_isk = -1;      // reserve (secure) hold
     std::string sky_last_raided;            // estimate clock start (ISO)
+    bool is_pos = false;              // classic starbase (control tower) row
+    std::string tower;                // full hull name ("Minmatar Control Tower Small")
+    std::string pos_race;             // amarr|caldari|gallente|minmatar - portrait pick
+    long long moon_id = 0;            // towers are attacked "at" their moon
+    bool pos_sov = false;             // sov -25% fuel discount applied to the burn rate
+    double stront = -1, stront_hours = -1;  // reinforce bay; -1 = bay unreadable
     std::vector<RefuelEvent> log;     // this structure's last refuel events
 };
+
+// stront bay planning yardstick: the longest reinforcement a tower can hold
+// (~41.7h); the stront meter fills against it
+static const double POS_STRONT_MAX_H = 41.7;
 
 // skyhook hold capacities from the SDE (type 81080 cargo = reserve hold,
 // type 81933 reagent silo = raidable surplus bay)
@@ -146,6 +166,7 @@ static std::string isk_compact(double v) {
 static std::string display_type(const std::string& t) {
     if (t == "Metenox Moon Drill") return "Metenox";
     if (t == "Orbital Skyhook") return "Skyhook";
+    if (t.find("Control Tower") != std::string::npos) return "POS";
     if (t.rfind("Ansiblex", 0) == 0) return "Jump-Bridge";
     if (t.rfind("Pharolux", 0) == 0) return "Cyno Bacon";  // yes, bacon
     return t;
@@ -186,6 +207,8 @@ struct Notif {
     time_t at = 0;
     long long sid = 0;
     long long system_id = 0;
+    long long moon_id = 0;  // Tower* notifications name the moon, not the hull
+    std::string by;  // MoonminingLaserFired: who pressed the button
 };
 static std::vector<Notif> g_notifs;
 static std::vector<Refuel> g_refuels;
@@ -206,6 +229,7 @@ static std::vector<std::string> g_intel_channels_cfg;
 static std::string g_pulled_at;
 static std::string g_corp_name;  // whose structures the active feed shows
 static std::string g_fuel2_status;  // ok|relogin|director|error|off - why F² has data or not
+static std::string g_starbases_status;  // ok|relogin|director|error|off - POS rows likewise
 static bool g_rentals_online = false;  // moon-rental classification feed reachable this pull
 static bool g_extractions_ok = false;  // corp mining extractions readable this pull
 static bool g_timers_ok = false;       // feed carries reinforcement timers (corp feed doesn't)
@@ -540,10 +564,63 @@ static time_t parse_iso(const std::string& s) {
 // when a newer tag exists the header offers [u], which downloads the matching
 // platform asset and swaps it over the running binary (Windows: the running
 // exe is renamed aside first, and the leftover .old is removed on next start).
-static const char* STOKER_VERSION = "v2.8.0";
+//
+// Releases are Ed25519-signed: build-release.sh signs each archive with the
+// key in ~/.config/stoker-release/ (tools/stoker-sign) and uploads the .sig
+// beside it. A release without a .sig for our platform is never offered, and
+// a downloaded archive that fails verification is never installed, so a
+// compromised GitHub account alone can't push code into running installs.
+// Rotating the key means shipping a new pubkey, which only helps people who
+// download that build manually: bake-and-forget, guard the private key.
+static const char* STOKER_VERSION = "v2.12.0";
 static const char* UPDATE_REPO = "niko-aubaris/stoker";
+static const char* UPDATE_PUBKEY_HEX =
+    "dfe0ff016e3fc59710da2eedf057951c7878c5daff864361d3fa9de4de55d8f2";
 static bool g_update_check = true;
-static std::string g_update_tag, g_update_url;  // set once by the worker (g_mtx)
+// set once by the worker (g_mtx)
+static std::string g_update_tag, g_update_url, g_update_sig_url;
+
+// config "native_titlebar": true = keep the OS window chrome (GUI only; the
+// custom Hot Neon title bar + border is the default)
+static bool g_native_titlebar = false;
+
+extern "C" {
+#include "tweetnacl.h"
+// TweetNaCl leaves the RNG to the host. The app never generates keys (verify
+// only), but the symbol must exist to link the vendored translation unit.
+void randombytes(unsigned char* p, unsigned long long n) {
+    std::random_device rd;
+    for (unsigned long long i = 0; i < n; i++) p[i] = (unsigned char)rd();
+}
+}
+
+static bool hex_to_bytes(const std::string& hex, unsigned char* out, size_t n) {
+    if (hex.size() < n * 2) return false;
+    for (size_t i = 0; i < n; i++) {
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hi = nib(hex[i * 2]), lo = nib(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (unsigned char)(hi * 16 + lo);
+    }
+    return true;
+}
+
+// detached Ed25519 verify via crypto_sign_open on sig||msg
+static bool ed25519_verify(const std::vector<unsigned char>& msg,
+                           const unsigned char sig[64], const unsigned char pk[32]) {
+    std::vector<unsigned char> sm(crypto_sign_BYTES + msg.size());
+    std::vector<unsigned char> out(sm.size());
+    memcpy(sm.data(), sig, crypto_sign_BYTES);
+    if (!msg.empty()) memcpy(sm.data() + crypto_sign_BYTES, msg.data(), msg.size());
+    unsigned long long outlen = 0;
+    return crypto_sign_open(out.data(), &outlen, sm.data(),
+                            (unsigned long long)sm.size(), pk) == 0;
+}
 
 static bool ver_newer(const std::string& a, const std::string& b) {
     // dotted-number compare, "v1.0.10" style; true when a > b
@@ -577,18 +654,31 @@ static void check_update() {
     if (st != 200 || !j.is_object()) return;
     std::string tag = j.value("tag_name", "");
     if (tag.empty() || !ver_newer(tag, STOKER_VERSION)) return;
+    // sig assets deliberately drop the archive extension: pre-2.10 updaters
+    // match assets by the "<platform>.<ext>" substring and would happily
+    // download a file named "*.tar.gz.sig" as the package itself
 #ifdef _WIN32
     const char* want = "windows-x64.zip";
+    const char* wsig = "windows-x64.sig";
 #else
     const char* want = "linux-x86_64.tar.gz";
+    const char* wsig = "linux-x86_64.sig";
 #endif
+    std::string url, sig_url;
     for (auto& a : j.value("assets", json::array())) {
-        if (a.value("name", std::string()).find(want) == std::string::npos) continue;
-        std::lock_guard<std::mutex> l(g_mtx);
-        g_update_tag = tag;
-        g_update_url = a.value("browser_download_url", "");
-        return;
+        std::string name = a.value("name", std::string());
+        if (name.find(wsig) != std::string::npos)
+            sig_url = a.value("browser_download_url", "");
+        else if (name.find(want) != std::string::npos)
+            url = a.value("browser_download_url", "");
     }
+    // unsigned release = not an update. Old builds would install it blind, so
+    // the release script must never publish archives without their .sig.
+    if (url.empty() || sig_url.empty()) return;
+    std::lock_guard<std::mutex> l(g_mtx);
+    g_update_tag = tag;
+    g_update_url = url;
+    g_update_sig_url = sig_url;
 }
 
 static std::filesystem::path own_exe() {
@@ -603,8 +693,10 @@ static std::filesystem::path own_exe() {
 #endif
 }
 
-// Download + swap. Returns the note-line text; never throws.
-static std::string apply_update(const std::string& tag, const std::string& url) try {
+// Download, verify the release signature, swap. Returns the note-line text;
+// never throws. An archive that fails verification is deleted, not installed.
+static std::string apply_update(const std::string& tag, const std::string& url,
+                                const std::string& sig_url) try {
     auto exe = own_exe();
     if (exe.empty()) return "update failed: cannot locate own executable";
     auto dir = standalone::config_dir() / "update";
@@ -617,8 +709,27 @@ static std::string apply_update(const std::string& tag, const std::string& url) 
     auto pkg = dir / "pkg.tar.gz";
 #endif
     auto fresh = dir / exe.filename();  // stoker or stoker-gui, whichever we are
-if (!standalone::download_file(url, pkg, 100000))
+    if (!standalone::download_file(url, pkg, 100000))
         return "update failed: download incomplete";
+    {
+        auto sigf = dir / "pkg.sig";
+        if (sig_url.empty() || !standalone::download_file(sig_url, sigf, 30))
+            return "update failed: release signature missing - not installing";
+        std::ifstream sf(sigf);
+        std::string sig_hex;
+        sf >> sig_hex;
+        unsigned char sig[crypto_sign_BYTES], pk[crypto_sign_PUBLICKEYBYTES];
+        if (!hex_to_bytes(sig_hex, sig, sizeof sig) ||
+            !hex_to_bytes(UPDATE_PUBKEY_HEX, pk, sizeof pk))
+            return "update failed: malformed release signature - not installing";
+        std::ifstream pf(pkg, std::ios::binary);
+        std::vector<unsigned char> body((std::istreambuf_iterator<char>(pf)),
+                                        std::istreambuf_iterator<char>());
+        if (body.empty() || !ed25519_verify(body, sig, pk)) {
+            std::filesystem::remove_all(dir, ec);
+            return "update failed: SIGNATURE CHECK FAILED - refusing to install";
+        }
+    }
     // Windows 10+ ships bsdtar as tar.exe, which also reads zip
     run_cmd(("tar -xf \"" + pkg.string() + "\" -C \"" + dir.string() + "\"" QUIET).c_str());
     if (!std::filesystem::exists(fresh))
@@ -651,7 +762,7 @@ if (!standalone::download_file(url, pkg, 100000))
     if (ec) return "update failed: cannot replace the binary";
 #endif
     std::filesystem::remove_all(dir, ec);
-    return "updated to " + tag + " - restart STOKER to run it";
+    return "updated to " + tag + " (signature verified) - restart STOKER to run it";
 } catch (const std::exception& e) {
     return std::string("update failed: ") + e.what();
 }
@@ -785,6 +896,10 @@ static void ingest(const std::string& raw) {
             r.sv_off = s["services_offline"].get<int>();
         r.extraction_start = s.value("extraction_start", "");
         r.chunk_arrival = s.value("chunk_arrival", "");
+        r.natural_decay = s.value("natural_decay", "");
+        r.drill_rig = s.value("drill_rig", "");
+        if (s.contains("drill_rig_tier") && !s["drill_rig_tier"].is_null())
+            r.drill_rig_tier = s["drill_rig_tier"].get<int>();
         r.services = s.value("services", "");
         r.fuel_expires = s.value("fuel_expires", "");
         if (s.contains("fuel_days_left") && !s["fuel_days_left"].is_null()) {
@@ -805,6 +920,12 @@ static void ingest(const std::string& raw) {
         if (s.contains("blocks_to_30d") && !s["blocks_to_30d"].is_null()) r.need = s["blocks_to_30d"].get<double>();
         if (s.contains("m3_to_30d") && !s["m3_to_30d"].is_null()) r.m3 = s["m3_to_30d"].get<double>();
         r.fuel2_name = fuel2_kind(r.type);
+        r.is_pos = s.value("is_pos", false);
+        if (r.is_pos) r.tower = r.type;  // keep the full hull name for the detail
+        r.pos_race = s.value("pos_race", "");
+        if (s.contains("moon_id") && s["moon_id"].is_number())
+            r.moon_id = s["moon_id"].get<long long>();
+        r.pos_sov = s.value("pos_sov", false);
         r.type = display_type(r.type);
         if (s.contains("fuel2_units") && !s["fuel2_units"].is_null())
             r.fuel2 = s["fuel2_units"].get<double>();
@@ -816,6 +937,14 @@ static void ingest(const std::string& raw) {
         r.goo_m3 = numf("goo_m3");
         r.goo_cap = numf("goo_capacity");
         r.goo_isk = numf("goo_isk");
+        if (s.contains("econ_net") && !s["econ_net"].is_null()) {
+            r.has_econ = true;
+            r.econ_goo = numf("econ_goo");
+            r.econ_rent = numf("econ_rent");
+            r.econ_fuel = numf("econ_fuel");
+            r.econ_gas = numf("econ_gas");
+            r.econ_net = s["econ_net"].get<double>();
+        }
         if (s.contains("goo") && s["goo"].is_array())
             for (auto& g : s["goo"]) {
                 GooItem gi;
@@ -833,6 +962,8 @@ static void ingest(const std::string& raw) {
         r.gas_day = numf("gas_per_day");
         r.gas_month = numf("gas_month_units");
         r.gas_m3 = numf("gas_month_m3");
+        r.stront = numf("pos_stront");
+        r.stront_hours = numf("pos_stront_hours");
         if (s.contains("refuel_log") && s["refuel_log"].is_array())
             for (auto& e : s["refuel_log"]) {
                 RefuelEvent ev;
@@ -929,8 +1060,24 @@ static void ingest(const std::string& raw) {
             n.sid = e["structure_id"].get<long long>();
         if (e.contains("system_id") && !e["system_id"].is_null())
             n.system_id = e["system_id"].get<long long>();
+        if (e.contains("moon_id") && e["moon_id"].is_number())
+            n.moon_id = e["moon_id"].get<long long>();
+        n.by = e.value("fired_by_name", "");
         notifs.push_back(std::move(n));
     } catch (const std::exception&) {}
+    // stamp the real chunk-fracture moment onto the refinery rows; whether it
+    // belongs to the current extraction cycle is decided at render time
+    // against chunk_arrival (newest event per structure wins)
+    for (auto& n : notifs) {
+        bool man = n.type == "MoonminingLaserFired";
+        if (!man && n.type != "MoonminingAutomaticFracture") continue;
+        for (auto& r : rows)
+            if (r.sid == n.sid && n.at > r.popped_at) {
+                r.popped_at = n.at;
+                r.popped_manual = man;
+                r.popped_by = n.by;
+            }
+    }
     std::lock_guard<std::mutex> l(g_mtx);
     g_rows = std::move(rows);
     g_refuels = std::move(refuels);
@@ -938,6 +1085,7 @@ static void ingest(const std::string& raw) {
     g_pulled_at = d.value("pulled_at", "");
     g_corp_name = d.value("corp", "");
     g_fuel2_status = d.value("fuel2_status", "");
+    g_starbases_status = d.value("starbases_status", "");
     g_rentals_online = d.value("rentals_online", false);
     g_extractions_ok = d.value("extractions_ok", false);
     g_timers_ok = d.value("timers_ok", false);
@@ -1089,8 +1237,8 @@ static void worker() {
         if (g_standalone) {
             // a manual refresh (g_busy) may already be mid-cycle: don't run a
             // second concurrent sweep against the same tokens and cache file
-            if (!g_busy) {
-                g_busy = true;
+            bool f0 = false;
+            if (g_busy.compare_exchange_strong(f0, true)) {
                 standalone_cycle();
                 g_busy = false;
             }
@@ -1133,6 +1281,23 @@ static bool corp_setup(json& cfg, const std::filesystem::path& cfg_path,
 static bool load_or_setup(bool force_corp) {
     auto dir = standalone::config_dir();
     auto cfg_path = dir / "config.json";
+    {
+        // first run: write a starter config so the knobs are discoverable.
+        // Deliberately NOT saved: "scopes" (persisting would freeze them
+        // across releases) and the shared dev-app client id (rotation).
+        std::error_code ec;
+        if (!std::filesystem::exists(cfg_path, ec)) {
+            json starter;
+            starter["_readme"] =
+                "STOKER settings - every key here is optional; see "
+                "https://github.com/niko-aubaris/stoker#readme";
+            starter["eve_logs"] = "auto";        // "off" disables the map intel/pilot overlay
+            starter["intel_channels"] = json::array();  // [] = any "intel"/".imperium" channel
+            starter["native_titlebar"] = false;  // true = OS window chrome
+            starter["update_check"] = true;
+            standalone::save_json_file(cfg_path, starter);
+        }
+    }
     json cfg = standalone::load_json_file(cfg_path);
     const char* e;
     if ((e = std::getenv("STOKER_ENDPOINT")) && *e) cfg["endpoint"] = e;
@@ -1150,6 +1315,17 @@ static bool load_or_setup(bool force_corp) {
         standalone::g_rentals_corp = cfg["rentals_corp_id"].get<long long>();
     if (cfg.contains("skyhooks_api") && cfg["skyhooks_api"].is_string())
         standalone::g_skyhooks_api = cfg["skyhooks_api"].get<std::string>();
+    if (cfg.contains("skyhook_watchlist") && cfg["skyhook_watchlist"].is_array())
+        standalone::g_skyhook_watchlist = cfg["skyhook_watchlist"];
+    if (cfg.contains("econ_api") && cfg["econ_api"].is_string()) {
+        standalone::g_econ_api = cfg["econ_api"].get<std::string>();
+    } else if (!standalone::g_rentals_api.empty()) {
+        // same service as the rentals feed: .../stoker/rentals -> .../stoker/moon-econ
+        std::string ra = standalone::g_rentals_api;
+        size_t p = ra.rfind("/rentals");
+        if (p != std::string::npos && p == ra.size() - 8)
+            standalone::g_econ_api = ra.substr(0, p) + "/moon-econ";
+    }
     if (cfg.contains("eve_logs") && cfg["eve_logs"].is_string())
         g_eve_logs_cfg = cfg["eve_logs"].get<std::string>();
     if (cfg.contains("intel_channels") && cfg["intel_channels"].is_array())
@@ -1157,6 +1333,8 @@ static bool load_or_setup(bool force_corp) {
             if (v.is_string()) g_intel_channels_cfg.push_back(v.get<std::string>());
     if (cfg.contains("update_check") && cfg["update_check"].is_boolean())
         g_update_check = cfg["update_check"].get<bool>();
+    if (cfg.contains("native_titlebar") && cfg["native_titlebar"].is_boolean())
+        g_native_titlebar = cfg["native_titlebar"].get<bool>();
     if (cfg.contains("tab_type_filter") && cfg["tab_type_filter"].is_object())
         for (auto& [k, v] : cfg["tab_type_filter"].items())
             if (v.is_string()) g_tab_default_filter[k] = v.get<std::string>();
@@ -1361,8 +1539,58 @@ int main(int argc, char** argv) {
                 if (d.contains("skyhooks"))
                     line += "  skyhooks: " +
                             std::to_string(d.value("skyhooks", json::array()).size());
+                {
+                    int posn = 0;
+                    for (auto& st : d.value("structures", json::array()))
+                        if (st.value("is_pos", false)) posn++;
+                    std::string ps = d.value("starbases_status", "");
+                    if (posn || (ps != "ok" && ps != "off" && !ps.empty()))
+                        line += "  pos: " + std::to_string(posn) + " (" + ps + ")";
+                }
                 if (d.contains("error")) line += "  error: " + d.value("error", "");
                 std::printf("%s\n", line.c_str());
+                // announced theft windows per watched hook (live-only data)
+                for (auto& sk : d.value("skyhooks", json::array()))
+                    if (sk.contains("window_start") && sk["window_start"].is_string())
+                        std::printf("  skyhook %s %s window %s -> %s\n",
+                                    sk.value("system", "?").c_str(),
+                                    sk.value("planet_roman", "?").c_str(),
+                                    sk.value("window_start", "?").c_str(),
+                                    sk.value("window_end", "?").c_str());
+                // refinery moon-pull detail: schedule, auto-fracture, rig, pops
+                for (auto& st : d.value("structures", json::array()))
+                    if (st.contains("chunk_arrival") || st.contains("drill_rig_tier"))
+                        std::printf("  %-42s arrives %-22s decay %-22s rig %s\n",
+                                    st.value("name", "?").c_str(),
+                                    st.value("chunk_arrival", "-").c_str(),
+                                    st.value("natural_decay", "-").c_str(),
+                                    st.value("drill_rig",
+                                             st.value("drill_rig_tier", -1) == 0
+                                                 ? "none" : "?").c_str());
+                for (auto& st : d.value("structures", json::array()))
+                    if (st.contains("econ_net"))
+                        std::printf("  %-42s goo %s - rent %s - fuel %s - gas %s = NET %s\n",
+                                    st.value("name", "?").c_str(),
+                                    isk_compact(st.value("econ_goo", 0.0)).c_str(),
+                                    isk_compact(st.value("econ_rent", 0.0)).c_str(),
+                                    isk_compact(st.value("econ_fuel", 0.0)).c_str(),
+                                    isk_compact(st.value("econ_gas", 0.0)).c_str(),
+                                    (std::string(st.value("econ_net", 0.0) < 0 ? "-" : "") +
+                                     isk_compact(std::fabs(st.value("econ_net", 0.0)))).c_str());
+                int pops = 0;
+                for (auto& n : d.value("notifications", json::array()))
+                    if (n.value("type", "").rfind("Moonmining", 0) == 0) pops++;
+                if (pops) std::printf("  moonmining notifications seen: %d\n", pops);
+                for (auto& n : d.value("notifications", json::array())) {
+                    std::string nt = n.value("type", "");
+                    if (nt != "MoonminingLaserFired" && nt != "MoonminingAutomaticFracture")
+                        continue;
+                    std::printf("    %-30s %s  sid %lld%s%s\n", nt.c_str(),
+                                n.value("timestamp", "?").c_str(),
+                                n.value("structure_id", 0LL),
+                                nt[10] == 'L' ? "  by " : "",
+                                nt[10] == 'L' ? n.value("fired_by_name", "?").c_str() : "");
+                }
             }
         } else {
             json d = json::object();
@@ -1393,11 +1621,14 @@ int main(int argc, char** argv) {
     bool detail_mode = false;   // [->]: single-structure detail page
     long long detail_sid = 0;
     int offset = 0, sel = 0;
+    // [space] tally marks: the totals line sums these rows, or every visible
+    // row when nothing is marked
+    std::set<long long> marked;
 
     // background force-refresh
     auto force_refresh = [&]() {
-        if (g_busy) return;
-        g_busy = true;
+        bool f0 = false;
+        if (!g_busy.compare_exchange_strong(f0, true)) return;   // atomic claim, no TOCTOU
         { std::lock_guard<std::mutex> l(g_mtx); g_status = "kicking a live ESI pull on the box..."; }
         spawn_bg([&]() {
             if (g_standalone)
@@ -1414,34 +1645,66 @@ int main(int argc, char** argv) {
     // Runs detached; progress lands in the status line, the tab bar picks the
     // new corp up on the refresh that follows. g_busy doubles as the guard so
     // only one login (or refresh) runs at a time.
-    auto add_character = [&]() {
-        if (!g_standalone) return;
-        if (g_busy) {
+    auto run_login = [&]() {  // caller has already claimed g_busy
+        std::string err, name;
+        bool ok = standalone::login(g_client_id, err, &name, [&](const std::string& s) {
             std::lock_guard<std::mutex> l(g_mtx);
-            g_note = "busy with a refresh or login - try again in a moment";
-            g_note_at = time(nullptr);
-            return;
-        }
-        g_busy = true;
-        spawn_bg([&]() {
-            std::string err, name;
-            bool ok = standalone::login(g_client_id, err, &name, [&](const std::string& s) {
-                std::lock_guard<std::mutex> l(g_mtx);
-                g_status = s;
-                if (g_gui_wake) g_gui_wake();
-            else screen.PostEvent(Event::Custom);
-            });
-            {
-                std::lock_guard<std::mutex> l(g_mtx);
+            g_status = s;
+            if (g_gui_wake) g_gui_wake();
+        else screen.PostEvent(Event::Custom);
+        });
+        {
+            std::lock_guard<std::mutex> l(g_mtx);
+            // a cancelled login already announced its successor; stay quiet
+            if (ok || err != "cancelled") {
                 g_note = ok ? "added " + name : "login failed: " + err;
                 g_note_at = time(nullptr);
-                g_status = "";
             }
-            if (ok) standalone_cycle();  // new corp becomes a tab right away
-            g_busy = false;
-            if (g_run) if (g_gui_wake) g_gui_wake();
-            else screen.PostEvent(Event::Custom);
-        });
+            g_status = "";
+        }
+        if (ok) standalone_cycle();  // new corp becomes a tab right away
+        g_busy = false;
+        if (g_run) if (g_gui_wake) g_gui_wake();
+        else screen.PostEvent(Event::Custom);
+    };
+    auto add_character = [&]() {
+        if (!g_standalone) return;
+        bool f = false;
+        if (g_busy.compare_exchange_strong(f, true)) {
+            spawn_bg(run_login);
+            return;
+        }
+        if (standalone::login_pending()) {
+            // an abandoned browser login is holding the port: cancel it and
+            // start a fresh one the moment the old listener lets go (~1s)
+            static std::atomic<bool> s_takeover{false};
+            if (s_takeover.exchange(true)) return;  // restart already queued
+            {
+                std::lock_guard<std::mutex> l(g_mtx);
+                g_note = "previous login cancelled - opening a fresh EVE login...";
+                g_note_at = time(nullptr);
+            }
+            standalone::cancel_pending_login();
+            spawn_bg([&, run_login]() {
+                for (int i = 0; i < 100 && g_run; i++) {
+                    bool ff = false;
+                    if (g_busy.compare_exchange_strong(ff, true)) {
+                        s_takeover = false;
+                        run_login();
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                s_takeover = false;
+                std::lock_guard<std::mutex> l(g_mtx);
+                g_note = "could not take over the login - try again";
+                g_note_at = time(nullptr);
+            });
+            return;
+        }
+        std::lock_guard<std::mutex> l(g_mtx);
+        g_note = "still busy with a data refresh - try again in a few seconds";
+        g_note_at = time(nullptr);
     };
 
     // [1] claim: "I fueled this". With seen_at it stamps that exact logged
@@ -1456,7 +1719,8 @@ int main(int argc, char** argv) {
             g_note_at = time(nullptr);
             return;
         }
-        g_busy = true;
+        bool f0 = false;
+        if (!g_busy.compare_exchange_strong(f0, true)) return;   // atomic claim, no TOCTOU
         const char* env = std::getenv("STOKER_NAME");
         std::string who = (env && *env) ? env : "";  // backend fills its default
         { std::lock_guard<std::mutex> l(g_mtx); g_status = "filing claim..."; }
@@ -1505,6 +1769,8 @@ int main(int argc, char** argv) {
         std::string want = (type_idx > 0 && type_idx <= (int)types.size()) ? types[type_idx - 1] : "";
         std::vector<Row> f;
         for (auto& r : rows) {
+            // skyhooks live on their own tab only, never in All
+            if (want.empty() && r.is_skyhook) continue;
             if (!want.empty() && r.type != want) continue;
             if (!text_filter.empty()) {
                 std::string hay = r.name + " " + r.system;
@@ -1775,6 +2041,53 @@ int main(int argc, char** argv) {
             text(wide ? "   " + fresh + " " : " ") | color(INK_GRAY),
         });
 
+        // tally line: totals over the [space]-marked rows, or everything
+        // visible when nothing is marked. Only bays the data source can see
+        // contribute, so a Director-less corp feed just shows less.
+        Element tally_el = text("");
+        if (!log_mode) {
+            double blk = 0, gas = 0, oz = 0, goo = 0, goo_isk = 0;
+            bool any_isk = false;
+            int cnt = 0;
+            for (auto& r : rows) {
+                if (!marked.empty() && !marked.count(r.sid)) continue;
+                cnt++;
+                if (r.blocks_now >= 0) blk += r.blocks_now;
+                if (r.fuel2 >= 0) {
+                    if (r.fuel2_name == "Magmatic Gas") gas += r.fuel2;
+                    else if (r.fuel2_name == "Liquid Ozone") oz += r.fuel2;
+                }
+                if (r.goo_m3 >= 0) goo += r.goo_m3;
+                if (r.goo_isk >= 0) { goo_isk += r.goo_isk; any_isk = true; }
+            }
+            Elements te;
+            te.push_back(text(marked.empty() ? "total " + std::to_string(cnt)
+                                             : "tally " + std::to_string(cnt))
+                         | color(marked.empty() ? INK_GRAY : NEON_CYAN) |
+                         (marked.empty() ? nothing : bold));
+            te.push_back(text("  fuel ") | color(INK_GRAY));
+            te.push_back(text(commas(blk) + "/" + commas(blk * 5) + " m3")
+                         | color(Color::RGB(90, 225, 130)));
+            if (gas > 0) {
+                te.push_back(text("  gas ") | color(INK_GRAY));
+                te.push_back(text(commas(gas) + "/" + commas(gas * 0.01) + " m3")
+                             | color(NEON_PINK));
+            }
+            if (oz > 0) {
+                te.push_back(text("  ozone ") | color(INK_GRAY));
+                te.push_back(text(commas(oz) + "/" + commas(oz * 0.4) + " m3")
+                             | color(Color::RGB(120, 190, 255)));
+            }
+            if (goo > 0) {
+                te.push_back(text("  goo ") | color(INK_GRAY));
+                te.push_back(text(commas(goo) + " m3" +
+                                  (any_isk ? " (" + isk_compact(goo_isk) + ")" : ""))
+                             | color(NEON_CYAN));
+            }
+            te.push_back(text(" "));
+            tally_el = hbox(te);
+        }
+
         Element filt = hbox({
             text(" type ") | color(INK_GRAY), text(tsel) | color(NEON_CYAN),
             text("  sort ") | color(INK_GRAY), text(SORTN[sort_mode]) | color(NEON_CYAN),
@@ -1782,6 +2095,7 @@ int main(int argc, char** argv) {
             (filter_mode ? text(text_filter + "_") | color(Color::RGB(250, 215, 70))
                          : text(text_filter.empty() ? "none" : text_filter) | color(text_filter.empty() ? Color::RGB(128, 136, 150) : Color::RGB(90, 225, 130))),
             filler(),
+            tally_el,
             (!note.empty() ? text(" " + note + " ") | color(Color::RGB(90, 225, 130))
                  : !status.empty() ? text(" " + status + " ") | color(Color::RGB(250, 215, 70))
                  : g_busy ? text(" refreshing ") | color(Color::RGB(250, 215, 70)) | blink
@@ -1864,8 +2178,12 @@ int main(int argc, char** argv) {
                     text(pad(r.name, name_w)),
                 });
                 if (i == sel) rest = rest | inverted;
+                bool mk = marked.count(r.sid) > 0;
                 Element line = hbox({
-                    fuel_cell(r, 14), text(i == sel ? ">" : " ") | color(NEON_PINK) | bold,
+                    fuel_cell(r, 14),
+                    (i == sel ? text(">") | color(NEON_PINK) | bold
+                     : mk     ? text("*") | color(NEON_CYAN) | bold
+                              : text(" ")),
                     fuel2_cell(r, 14), text("  "),
                     rest,
                 });
@@ -1912,6 +2230,7 @@ int main(int argc, char** argv) {
             {"tab", "type", "type", true},
             {"s", "sort", "sort", true},
             {"/", "filter", "filt", true},
+            {"spc", "tally", "tly", !log_mode},
             {"f", "refuel log", "log", true},
             {"→", "details", "info", true},
             {"c", "corp", "corp", have_tabs},
@@ -2032,6 +2351,7 @@ int main(int argc, char** argv) {
         if (e == Event::Character("q")) { g_run = false; screen.Exit(); return true; }
         if (e == Event::Escape) {
             if (log_mode) { log_mode = false; sel = 0; offset = 0; return true; }
+            if (!marked.empty()) { marked.clear(); return true; }  // drop tally first
             g_run = false; screen.Exit(); return true;
         }
         if (e == Event::Character("f")) { log_mode = !log_mode; sel = 0; offset = 0; return true; }
@@ -2063,22 +2383,30 @@ int main(int argc, char** argv) {
             if (sid) send_claim(sid, seen_at);
             return true;
         }
+        if (e == Event::Character(" ")) {  // toggle tally mark on the highlighted row
+            if (!log_mode) {
+                long long sid = selected_sid(nullptr);
+                if (sid && !marked.erase(sid)) marked.insert(sid);
+            }
+            return true;
+        }
         if (e == Event::Character("/")) { filter_mode = true; return true; }
         if (e == Event::Character("u")) {  // apply a pending self-update
-            std::string tag, url;
+            std::string tag, url, sig;
             {
                 std::lock_guard<std::mutex> l(g_mtx);
                 tag = g_update_tag;
                 url = g_update_url;
+                sig = g_update_sig_url;
             }
-            if (!tag.empty() && !g_busy) {
-                g_busy = true;
+            bool f0 = false;
+            if (!tag.empty() && g_busy.compare_exchange_strong(f0, true)) {
                 {
                     std::lock_guard<std::mutex> l(g_mtx);
                     g_status = "downloading " + tag + "...";
                 }
-                spawn_bg([&, tag, url]() {
-                    std::string res = apply_update(tag, url);
+                spawn_bg([&, tag, url, sig]() {
+                    std::string res = apply_update(tag, url, sig);
                     {
                         std::lock_guard<std::mutex> l(g_mtx);
                         g_note = res;
@@ -2165,6 +2493,8 @@ int main(int argc, char** argv) {
     screen.Loop(component);
 #endif
     g_run = false;
+    // a pending browser login would otherwise hold its join for up to 3 min
+    standalone::cancel_pending_login();
     if (th.joinable()) th.join();
     {
         std::lock_guard<std::mutex> l(g_bg_mtx);
